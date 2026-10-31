@@ -1,4 +1,3 @@
-# 다온 클래스 - Jinja block 오류 수정 버전
 import os, secrets
 from datetime import datetime
 from functools import wraps
@@ -56,6 +55,18 @@ class Order(db.Model):
 
 with app.app_context():
     db.create_all()
+
+    # 관리자 계정 강제 생성/업데이트 (kimsiwoo / kimsiwoo)
+    admin = User.query.filter_by(username="kimsiwoo").first()
+    if not admin:
+        admin = User(username="kimsiwoo", email="admin@daonshop.cloud", is_admin=True)
+        admin.set_password("kimsiwoo")
+        db.session.add(admin)
+    else:
+        admin.is_admin = True
+        admin.set_password("kimsiwoo")
+    db.session.commit()
+
     if Product.query.count() == 0:
         for t,d,p in [
             ("유튜브 100만 기법","유튜브 채널을 100만 구독자까지 성장시키는 실전 기법.",99000),
@@ -169,7 +180,6 @@ def signup():
         else:
             user = User(username=username, email=email)
             user.set_password(password)
-            if User.query.count() == 0: user.is_admin = True
             db.session.add(user); db.session.commit()
             session["user_id"] = user.id
             flash("회원가입 완료!","success")
@@ -304,9 +314,12 @@ def admin():
     prod_rows = ""
     for p in products:
         pdf = '<span class="text-green-600 text-xs">PDF</span>' if p.pdf_filename else ""
-        prod_rows += f'''<div class="bg-white rounded-xl border p-4 flex justify-between">
+        prod_rows += f'''<div class="bg-white rounded-xl border p-4 flex justify-between items-center">
         <span>{p.title} - {p.price:,}원 {pdf}</span>
-        <a href="/admin/product/{p.id}" class="text-indigo-600 text-sm">수정</a></div>'''
+        <div class="flex gap-3">
+        <a href="/admin/product/{p.id}" class="text-indigo-600 text-sm">수정</a>
+        <a href="/admin/product/delete/{p.id}" class="text-red-600 text-sm" onclick="return confirm('정말 삭제하시겠습니까?')">삭제</a>
+        </div></div>'''
     return render(f'''<h1 class="text-2xl font-bold mb-6">관리자</h1>
     <h2 class="font-semibold mb-3">주문 관리</h2>
     <div class="space-y-3 mb-10">{order_rows or '<p class="text-gray-500">주문이 없습니다.</p>'}</div>
@@ -322,6 +335,23 @@ def admin_pay(oid):
     if order.status == "pending":
         order.status = "paid"; order.paid_at = datetime.utcnow()
         db.session.commit(); flash("결제완료 처리했습니다.","success")
+    return redirect("/admin")
+
+
+@app.route("/admin/product/delete/<int:pid>")
+@admin_required
+def admin_product_delete(pid):
+    product = Product.query.get_or_404(pid)
+    if product.pdf_filename:
+        pdf_path = os.path.join("uploads", product.pdf_filename)
+        if os.path.exists(pdf_path):
+            try:
+                os.remove(pdf_path)
+            except:
+                pass
+    db.session.delete(product)
+    db.session.commit()
+    flash("상품이 삭제되었습니다.", "success")
     return redirect("/admin")
 
 
