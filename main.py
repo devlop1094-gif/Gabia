@@ -1,13 +1,37 @@
-import os, secrets
+daonshop.cloud / api.daonshop.cloud 지원
+import os, secrets, json
 from datetime import datetime
 from functools import wraps
-from flask import Flask, request, redirect, session, flash, send_file, abort, get_flashed_messages
+from flask import Flask, request, redirect, session, flash, send_file, abort, get_flashed_messages, jsonify
 from flask_sqlalchemy import SQLAlchemy
+from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
+from openai import OpenAI
+
+# .env 지원 (선택)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 app = Flask(__name__)
-app.secret_key = "daon-class-2026-secret"
+app.secret_key = os.environ.get("SECRET_KEY", "daon-class-2026-secret")
+
+# CORS: api.daonshop.cloud 및 메인 도메인 허용
+CORS(app, resources={
+    r"/api/*": {
+        "origins": [
+            "https://daonshop.cloud",
+            "https://www.daonshop.cloud",
+            "https://api.daonshop.cloud",
+            "http://localhost:5000",
+            "http://127.0.0.1:5000",
+        ],
+        "supports_credentials": True,
+    }
+})
 
 db_url = os.environ.get("DATABASE_URL", "")
 if db_url:
@@ -20,9 +44,61 @@ app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 os.makedirs("uploads", exist_ok=True)
 db = SQLAlchemy(app)
 
+# ===== 은행 정보 =====
 BANK_NAME = "카카오뱅크"
 BANK_ACCOUNT = "7777-03-0806539"
 BANK_HOLDER = "김시우"
+
+# ===== AI 챗봇 설정 (xAI Grok 또는 OpenAI 호환) =====
+# 환경변수:
+#   XAI_API_KEY 또는 OPENAI_API_KEY
+#   OPENAI_BASE_URL (기본: https://api.x.ai/v1)
+#   OPENAI_MODEL (기본: grok-4.7 또는 gpt-4o-mini 등)
+XAI_API_KEY = os.environ.get("XAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.x.ai/v1")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "grok-4.7")
+
+openai_client = None
+if XAI_API_KEY:
+    openai_client = OpenAI(api_key=XAI_API_KEY, base_url=OPENAI_BASE_URL)
+
+# 상품 정보를 시스템 프롬프트에 넣기 위한 헬퍼
+def get_products_info():
+    products = Product.query.filter_by(is_active=True).all()
+    if not products:
+        return "현재 등록된 강의가 없습니다."
+    lines = []
+    for p in products:
+        lines.append(f"- {p.title}: {p.price:,}원 / {p.description or '설명 없음'}")
+    return "\n".join(lines)
+
+SYSTEM_PROMPT_TEMPLATE = """당신은 '다온 클래스'의 친절한 AI 상담 봇입니다.
+사이트: https://daonshop.cloud
+역할: 강의 안내, 구매 방법 설명, 입금 안내, 자주 묻는 질문 답변.
+
+[현재 판매 중인 강의]
+{products}
+
+[결제 방법 - 매우 중요]
+- 무통장 입금만 가능합니다.
+- 은행: {bank_name}
+- 계좌번호: {bank_account}
+- 예금주: {bank_holder}
+- 입금 후 관리자가 확인하면 '내 강의'에서 PDF를 다운로드할 수 있습니다.
+
+[사이트 이용 안내]
+- 회원가입/로그인 후 강의를 구매할 수 있습니다.
+- 이미 구매한 강의는 다시 구매할 수 없습니다.
+- PDF는 결제 완료 후 '내 강의' 메뉴에서 다운로드합니다.
+- 관리자 문의가 필요하면 "관리자에게 문의해 주세요"라고 안내하세요.
+
+답변 규칙:
+1. 항상 한국어로 친절하고 간결하게 답변하세요.
+2. 가격, 계좌번호 등 정확한 정보를 그대로 사용하세요.
+3. 모르는 내용은 추측하지 말고 "자세한 내용은 관리자에게 문의해 주세요"라고 하세요.
+4. 응원과 격려를 섞어 친근하게 대화하세요.
+5. 답변은 너무 길지 않게 3~6문장 정도로 유지하세요.
+"""
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -118,6 +194,102 @@ def render(body):
         cls = "bg-red-100 text-red-700" if cat == "error" else "bg-green-100 text-green-700"
         flashes += f'<div class="mb-4 p-4 rounded-lg {cls}">{msg}</div>'
 
+    # 실시간 AI 상담 봇 위젯 (플로팅)
+    chat_widget = '''
+<!-- AI 상담 봇 위젯 -->
+<div id="chat-widget" class="fixed bottom-6 right-6 z-50">
+  <button id="chat-toggle" onclick="toggleChat()" class="bg-indigo-600 hover:bg-indigo-700 text-white rounded-full w-14 h-14 shadow-lg flex items-center justify-center text-2xl transition">
+    💬
+  </button>
+  <div id="chat-box" class="hidden absolute bottom-16 right-0 w-80 sm:w-96 bg-white rounded-2xl shadow-2xl border border-gray-200 overflow-hidden flex flex-col" style="height: 420px;">
+    <div class="bg-indigo-600 text-white px-4 py-3 flex justify-between items-center">
+      <div>
+        <div class="font-semibold">다온 클래스 상담봇</div>
+        <div class="text-xs opacity-80">AI가 실시간으로 도와드려요</div>
+      </div>
+      <button onclick="toggleChat()" class="text-white/80 hover:text-white text-xl">&times;</button>
+    </div>
+    <div id="chat-messages" class="flex-1 overflow-y-auto p-4 space-y-3 bg-gray-50 text-sm">
+      <div class="flex justify-start">
+        <div class="bg-white border rounded-2xl rounded-tl-none px-3 py-2 max-w-[85%] shadow-sm">
+          안녕하세요! 다온 클래스입니다 😊<br>
+          강의 안내, 구매 방법, 입금 문의 등 무엇이든 물어보세요.
+        </div>
+      </div>
+    </div>
+    <div class="p-3 border-t bg-white">
+      <form id="chat-form" onsubmit="sendChat(event)" class="flex gap-2">
+        <input id="chat-input" type="text" placeholder="메시지를 입력하세요..." autocomplete="off"
+               class="flex-1 border rounded-full px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400">
+        <button type="submit" class="bg-indigo-600 text-white rounded-full px-4 py-2 text-sm hover:bg-indigo-700">전송</button>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+const chatHistory = [];
+let chatOpen = false;
+
+function toggleChat() {
+  const box = document.getElementById('chat-box');
+  chatOpen = !chatOpen;
+  box.classList.toggle('hidden', !chatOpen);
+  if (chatOpen) document.getElementById('chat-input').focus();
+}
+
+function addMessage(role, content) {
+  const container = document.getElementById('chat-messages');
+  const isUser = role === 'user';
+  const div = document.createElement('div');
+  div.className = 'flex ' + (isUser ? 'justify-end' : 'justify-start');
+  div.innerHTML = `<div class="${isUser ? 'bg-indigo-600 text-white rounded-2xl rounded-tr-none' : 'bg-white border rounded-2xl rounded-tl-none shadow-sm'} px-3 py-2 max-w-[85%]">${content.replace(/\n/g, '<br>')}</div>`;
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
+}
+
+async function sendChat(e) {
+  e.preventDefault();
+  const input = document.getElementById('chat-input');
+  const msg = input.value.trim();
+  if (!msg) return;
+  input.value = '';
+  addMessage('user', msg);
+  chatHistory.push({role: 'user', content: msg});
+
+  // 로딩 표시
+  const loadingId = 'loading-' + Date.now();
+  const container = document.getElementById('chat-messages');
+  const loadingDiv = document.createElement('div');
+  loadingDiv.id = loadingId;
+  loadingDiv.className = 'flex justify-start';
+  loadingDiv.innerHTML = `<div class="bg-white border rounded-2xl rounded-tl-none px-3 py-2 text-gray-400 text-sm">답변 생성 중...</div>`;
+  container.appendChild(loadingDiv);
+  container.scrollTop = container.scrollHeight;
+
+  try {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({message: msg, history: chatHistory.slice(-10)})
+    });
+    const data = await res.json();
+    document.getElementById(loadingId)?.remove();
+    if (data.reply) {
+      addMessage('assistant', data.reply);
+      chatHistory.push({role: 'assistant', content: data.reply});
+    } else {
+      addMessage('assistant', data.error || '죄송합니다. 잠시 후 다시 시도해 주세요.');
+    }
+  } catch (err) {
+    document.getElementById(loadingId)?.remove();
+    addMessage('assistant', '네트워크 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.');
+  }
+}
+</script>
+'''
+
     return f'''<!DOCTYPE html>
 <html lang="ko"><head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -133,9 +305,12 @@ def render(body):
 {flashes}
 {body}
 </main>
-<footer class="border-t mt-12 py-6 text-center text-gray-400 text-sm">© 2026 다온 클래스</footer>
+<footer class="border-t mt-12 py-6 text-center text-gray-400 text-sm">© 2026 다온 클래스 · <a href="https://daonshop.cloud" class="underline">daonshop.cloud</a></footer>
+{chat_widget}
 </body></html>'''
 
+
+# ==================== 메인 페이지 라우트 ====================
 
 @app.route("/")
 def index():
@@ -388,6 +563,110 @@ def admin_product(pid=None):
     </form></div>''')
 
 
+# ==================== API 엔드포인트 (api.daonshop.cloud 용) ====================
+
+@app.route("/api/health")
+def api_health():
+    return jsonify({
+        "status": "ok",
+        "service": "daon-class-api",
+        "domain": "api.daonshop.cloud",
+        "chat_enabled": bool(openai_client),
+        "time": datetime.utcnow().isoformat() + "Z"
+    })
+
+
+@app.route("/api/products")
+def api_products():
+    products = Product.query.filter_by(is_active=True).all()
+    return jsonify([{
+        "id": p.id,
+        "title": p.title,
+        "description": p.description,
+        "price": p.price,
+        "has_pdf": bool(p.pdf_filename)
+    } for p in products])
+
+
+@app.route("/api/chat", methods=["POST"])
+def api_chat():
+    """실시간 AI 상담 봇 API
+    POST JSON: {"message": "질문", "history": [{"role":"user","content":"..."}, ...]}
+    """
+    if not openai_client:
+        return jsonify({
+            "error": "AI 상담 봇이 설정되지 않았습니다. 관리자에게 XAI_API_KEY 또는 OPENAI_API_KEY를 설정해 달라고 요청하세요."
+        }), 503
+
+    data = request.get_json(silent=True) or {}
+    message = (data.get("message") or "").strip()
+    history = data.get("history") or []
+
+    if not message:
+        return jsonify({"error": "메시지를 입력해 주세요."}), 400
+
+    # 시스템 프롬프트 생성
+    try:
+        products_info = get_products_info()
+    except Exception:
+        products_info = "강의 정보를 불러올 수 없습니다."
+
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
+        products=products_info,
+        bank_name=BANK_NAME,
+        bank_account=BANK_ACCOUNT,
+        bank_holder=BANK_HOLDER,
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    # 히스토리 정리 (최근 것만, 역할 검증)
+    for h in history[-8:]:
+        role = h.get("role")
+        content = (h.get("content") or "").strip()
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+
+    # 현재 메시지 추가 (중복 방지)
+    if not messages or messages[-1].get("content") != message:
+        messages.append({"role": "user", "content": message})
+
+    try:
+        resp = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            max_tokens=600,
+            temperature=0.7,
+        )
+        reply = resp.choices[0].message.content.strip()
+        return jsonify({
+            "reply": reply,
+            "model": OPENAI_MODEL,
+        })
+    except Exception as e:
+        # 키 오류나 네트워크 오류 등을 사용자 친화적으로
+        err_msg = str(e)
+        if "api_key" in err_msg.lower() or "authentication" in err_msg.lower():
+            return jsonify({"error": "AI 서비스 인증에 실패했습니다. 관리자에게 문의해 주세요."}), 503
+        return jsonify({"error": "상담 봇 응답 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."}), 500
+
+
+# 간단한 공개 정보 API (api.daonshop.cloud에서 사용 가능)
+@app.route("/api/info")
+def api_info():
+    return jsonify({
+        "name": "다온 클래스",
+        "domain": "daonshop.cloud",
+        "api_domain": "api.daonshop.cloud",
+        "bank": {
+            "name": BANK_NAME,
+            "account": BANK_ACCOUNT,
+            "holder": BANK_HOLDER,
+        },
+        "features": ["강의 판매", "무통장 입금", "PDF 다운로드", "AI 실시간 상담 봇"],
+    })
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG") == "1")
