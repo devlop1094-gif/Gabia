@@ -1,4 +1,3 @@
-daonshop.cloud / api.daonshop.cloud 지원
 import os, secrets, json
 from datetime import datetime
 from functools import wraps
