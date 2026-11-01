@@ -1,4 +1,3 @@
-# Daon Class - AI Chatbot + daonshop.cloud support
 import os, secrets, json
 from datetime import datetime
 from functools import wraps
@@ -200,17 +199,19 @@ def render(body):
     # 실시간 AI 상담 봇 위젯 (플로팅)
     chat_widget = '''
 <!-- AI 상담 봇 위젯 -->
-<div id="chat-widget" class="fixed bottom-6 right-6 z-50">
-  <button id="chat-toggle" onclick="toggleChat()" class="bg-indigo-600 hover:bg-indigo-700 text-white rounded-full w-14 h-14 shadow-lg flex items-center justify-center text-2xl transition">
+<div id="chat-widget" class="fixed bottom-5 right-5 z-[9999]" style="pointer-events:auto;">
+  <button type="button" id="chat-toggle" onclick="toggleChat()" 
+          class="bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-full w-14 h-14 shadow-xl flex items-center justify-center text-2xl transition cursor-pointer"
+          style="pointer-events:auto; -webkit-tap-highlight-color:transparent;">
     💬
   </button>
-  <div id="chat-box" class="hidden absolute bottom-16 right-0 w-80 sm:w-96 bg-white rounded-2xl shadow-2xl border border-gray-200 overflow-hidden flex flex-col" style="height: 420px;">
-    <div class="bg-indigo-600 text-white px-4 py-3 flex justify-between items-center">
+  <div id="chat-box" class="hidden fixed bottom-20 right-5 w-[calc(100vw-2.5rem)] max-w-sm bg-white rounded-2xl shadow-2xl border border-gray-200 overflow-hidden flex flex-col z-[9999]" style="height:min(420px,70vh); pointer-events:auto;">
+    <div class="bg-indigo-600 text-white px-4 py-3 flex justify-between items-center flex-shrink-0">
       <div>
-        <div class="font-semibold">다온 클래스 상담봇</div>
+        <div class="font-semibold text-sm">다온 클래스 상담봇</div>
         <div class="text-xs opacity-80">AI가 실시간으로 도와드려요</div>
       </div>
-      <button onclick="toggleChat()" class="text-white/80 hover:text-white text-xl">&times;</button>
+      <button type="button" onclick="toggleChat()" class="text-white/80 hover:text-white text-2xl leading-none px-1">&times;</button>
     </div>
     <div id="chat-messages" class="flex-1 overflow-y-auto p-4 space-y-3 bg-gray-50 text-sm">
       <div class="flex justify-start">
@@ -220,7 +221,7 @@ def render(body):
         </div>
       </div>
     </div>
-    <div class="p-3 border-t bg-white">
+    <div class="p-3 border-t bg-white flex-shrink-0">
       <form id="chat-form" onsubmit="sendChat(event)" class="flex gap-2">
         <input id="chat-input" type="text" placeholder="메시지를 입력하세요..." autocomplete="off"
                class="flex-1 border rounded-full px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400">
@@ -235,63 +236,72 @@ const chatHistory = [];
 let chatOpen = false;
 
 function toggleChat() {
-  const box = document.getElementById('chat-box');
+  const box = document.getElementById("chat-box");
+  if (!box) return;
   chatOpen = !chatOpen;
-  box.classList.toggle('hidden', !chatOpen);
-  if (chatOpen) document.getElementById('chat-input').focus();
+  if (chatOpen) {
+    box.classList.remove("hidden");
+    setTimeout(function(){ var el = document.getElementById("chat-input"); if(el) el.focus(); }, 50);
+  } else {
+    box.classList.add("hidden");
+  }
 }
 
 function addMessage(role, content) {
-  const container = document.getElementById('chat-messages');
-  const isUser = role === 'user';
-  const div = document.createElement('div');
-  div.className = 'flex ' + (isUser ? 'justify-end' : 'justify-start');
-  div.innerHTML = `<div class="${isUser ? 'bg-indigo-600 text-white rounded-2xl rounded-tr-none' : 'bg-white border rounded-2xl rounded-tl-none shadow-sm'} px-3 py-2 max-w-[85%]">${content.replace(/\n/g, '<br>')}</div>`;
+  const container = document.getElementById("chat-messages");
+  if (!container) return;
+  const isUser = role === "user";
+  const div = document.createElement("div");
+  div.className = "flex " + (isUser ? "justify-end" : "justify-start");
+  var safe = (content || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\\n/g,"<br>");
+  div.innerHTML = "<div class=\\"" + (isUser ? "bg-indigo-600 text-white rounded-2xl rounded-tr-none" : "bg-white border rounded-2xl rounded-tl-none shadow-sm") + " px-3 py-2 max-w-[85%]\\">" + safe + "</div>";
   container.appendChild(div);
   container.scrollTop = container.scrollHeight;
 }
 
 async function sendChat(e) {
   e.preventDefault();
-  const input = document.getElementById('chat-input');
-  const msg = input.value.trim();
+  const input = document.getElementById("chat-input");
+  const msg = (input && input.value || "").trim();
   if (!msg) return;
-  input.value = '';
-  addMessage('user', msg);
-  chatHistory.push({role: 'user', content: msg});
+  input.value = "";
+  addMessage("user", msg);
+  chatHistory.push({role: "user", content: msg});
 
-  // 로딩 표시
-  const loadingId = 'loading-' + Date.now();
-  const container = document.getElementById('chat-messages');
-  const loadingDiv = document.createElement('div');
+  const loadingId = "loading-" + Date.now();
+  const container = document.getElementById("chat-messages");
+  const loadingDiv = document.createElement("div");
   loadingDiv.id = loadingId;
-  loadingDiv.className = 'flex justify-start';
-  loadingDiv.innerHTML = `<div class="bg-white border rounded-2xl rounded-tl-none px-3 py-2 text-gray-400 text-sm">답변 생성 중...</div>`;
+  loadingDiv.className = "flex justify-start";
+  loadingDiv.innerHTML = "<div class=\\"bg-white border rounded-2xl rounded-tl-none px-3 py-2 text-gray-400 text-sm\\">답변 생성 중...</div>";
   container.appendChild(loadingDiv);
   container.scrollTop = container.scrollHeight;
 
   try {
-    const res = await fetch('/api/chat', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      credentials: 'same-origin',
+    const res = await fetch("/api/chat", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      credentials: "same-origin",
       body: JSON.stringify({message: msg, history: chatHistory.slice(-10)})
     });
     const data = await res.json();
-    document.getElementById(loadingId)?.remove();
+    var ld = document.getElementById(loadingId);
+    if (ld) ld.remove();
     if (data.reply) {
-      addMessage('assistant', data.reply);
-      chatHistory.push({role: 'assistant', content: data.reply});
+      addMessage("assistant", data.reply);
+      chatHistory.push({role: "assistant", content: data.reply});
     } else {
-      addMessage('assistant', data.error || '죄송합니다. 잠시 후 다시 시도해 주세요.');
+      addMessage("assistant", data.error || "죄송합니다. 잠시 후 다시 시도해 주세요.");
     }
   } catch (err) {
-    document.getElementById(loadingId)?.remove();
-    addMessage('assistant', '네트워크 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.');
+    var ld2 = document.getElementById(loadingId);
+    if (ld2) ld2.remove();
+    addMessage("assistant", "네트워크 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.");
   }
 }
 </script>
 '''
+
 
     return f'''<!DOCTYPE html>
 <html lang="ko"><head>
