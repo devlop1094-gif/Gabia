@@ -1,4 +1,4 @@
-import os, secrets, json
+import os, secrets, json, urllib.request
 from datetime import datetime
 from functools import wraps
 from flask import Flask, request, redirect, session, flash, send_file, abort, get_flashed_messages, jsonify
@@ -116,6 +116,44 @@ def get_bot_reply(message: str) -> str:
     return DEFAULT_REPLY
 
 
+def fetch_account_lines(url: str) -> list:
+    """GitHub raw URL에서 계정 목록(한 줄 = 1계정)을 가져온다."""
+    if not url or not url.strip():
+        return []
+    try:
+        req = urllib.request.Request(url.strip(), headers={"User-Agent": "DaonClass/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            text = resp.read().decode("utf-8", errors="ignore")
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+        return lines
+    except Exception as e:
+        print(f"[account] fetch failed: {e}")
+        return []
+
+
+def assign_accounts_from_url(product, count: int = 1) -> str:
+    """
+    GitHub raw 목록에서 아직 지급되지 않은 계정을 count개 가져와
+    줄바꿈으로 이은 문자열로 반환. 부족하면 있는 만큼만.
+    """
+    url = (product.account_list_url or "").strip()
+    if not url:
+        return ""
+    all_lines = fetch_account_lines(url)
+    if not all_lines:
+        return ""
+    # 이미 지급된 계정 모음
+    used = set()
+    for o in Order.query.filter(Order.delivered_account.isnot(None), Order.delivered_account != "").all():
+        for line in (o.delivered_account or "").splitlines():
+            line = line.strip()
+            if line:
+                used.add(line)
+    available = [ln for ln in all_lines if ln not in used]
+    take = available[:max(1, count)]
+    return "\n".join(take)
+
+
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     username = db.Column(db.String(80), unique=True, nullable=False)
@@ -133,6 +171,7 @@ class Product(db.Model):
     pdf_filename = db.Column(db.String(300), default="")
     is_active = db.Column(db.Boolean, default=True)
     stock = db.Column(db.Integer, default=999)  # 재고 (로블록스 계정 등)
+    account_list_url = db.Column(db.String(500), default="")  # GitHub raw 계정 목록 URL
 
 class Order(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -143,23 +182,34 @@ class Order(db.Model):
     status = db.Column(db.String(20), default="pending")
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     paid_at = db.Column(db.DateTime, nullable=True)
+    delivered_account = db.Column(db.Text, default="")  # 지급된 로블록스 계정 정보
     user = db.relationship("User", backref="orders")
     product = db.relationship("Product", backref="orders")
 
 with app.app_context():
     db.create_all()
 
-    # 기존 DB에 stock 컬럼이 없으면 추가 (Render 등 기존 테이블 대응)
+    # 기존 DB에 새 컬럼이 없으면 추가 (Render 등 기존 테이블 대응)
     try:
         from sqlalchemy import text, inspect
         inspector = inspect(db.engine)
-        cols = [c["name"] for c in inspector.get_columns("product")]
-        if "stock" not in cols:
-            with db.engine.begin() as conn:
+        # product 테이블
+        prod_cols = [c["name"] for c in inspector.get_columns("product")]
+        with db.engine.begin() as conn:
+            if "stock" not in prod_cols:
                 conn.execute(text("ALTER TABLE product ADD COLUMN stock INTEGER DEFAULT 999"))
-            print("[migrate] product.stock column added")
+                print("[migrate] product.stock column added")
+            if "account_list_url" not in prod_cols:
+                conn.execute(text("ALTER TABLE product ADD COLUMN account_list_url VARCHAR(500) DEFAULT ''"))
+                print("[migrate] product.account_list_url column added")
+        # order 테이블
+        order_cols = [c["name"] for c in inspector.get_columns("order")]
+        with db.engine.begin() as conn:
+            if "delivered_account" not in order_cols:
+                conn.execute(text("ALTER TABLE \"order\" ADD COLUMN delivered_account TEXT DEFAULT ''"))
+                print("[migrate] order.delivered_account column added")
     except Exception as e:
-        print(f"[migrate] stock column check/add skipped: {e}")
+        print(f"[migrate] column check/add skipped: {e}")
 
     # 관리자 계정 강제 생성/업데이트 (kimsiwoo / kimsiwoo)
     admin = User.query.filter_by(username="kimsiwoo").first()
@@ -589,12 +639,24 @@ def my_courses():
         is_roblox = "로블록스" in (o.product.title or "")
         if o.product.pdf_filename:
             btn = f'<a href="/download/{o.id}" class="bg-indigo-600 text-white px-5 py-2.5 rounded-lg text-sm">PDF 다운로드</a>'
+            extra = ""
         elif is_roblox:
-            btn = '<span class="text-sm text-green-600 font-medium">계정 전달 예정 / 관리자 확인 완료</span>'
+            if o.delivered_account:
+                safe_acc = (o.delivered_account or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+                btn = ""
+                extra = f'''<div class="mt-3 w-full bg-gray-50 border rounded-lg p-3 text-sm">
+                <div class="font-medium text-green-700 mb-1">지급된 계정 정보</div>
+                <pre class="whitespace-pre-wrap break-all font-mono text-gray-800">{safe_acc}</pre>
+                </div>'''
+            else:
+                btn = '<span class="text-sm text-yellow-600 font-medium">계정 준비 중 (관리자 확인 후 자동 지급)</span>'
+                extra = ""
         else:
             btn = '<span class="text-sm text-gray-400">PDF 준비 중</span>'
-        rows += f'''<div class="bg-white rounded-xl border p-5 flex justify-between items-center">
-        <div><h3 class="font-semibold text-lg">{o.product.title}</h3></div>{btn}</div>'''
+            extra = ""
+        rows += f'''<div class="bg-white rounded-xl border p-5">
+        <div class="flex justify-between items-center">
+        <div><h3 class="font-semibold text-lg">{o.product.title}</h3></div>{btn}</div>{extra}</div>'''
     if not rows: rows = '<p class="text-gray-500">아직 구매한 상품이 없습니다. <a href="/" class="text-indigo-600">강의 보러가기</a> · <a href="/roblox" class="text-indigo-600">로블록스 계정</a></p>'
     return render(f'<h1 class="text-2xl font-bold mb-6">내 강의 / 구매 상품</h1><div class="space-y-4">{rows}</div>')
 
@@ -651,12 +713,21 @@ def admin_pay(oid):
     if order.status == "pending":
         order.status = "paid"
         order.paid_at = datetime.utcnow()
-        # 재고 차감 (로블록스 계정 등)
         product = order.product
+        # 재고 차감
         if product and product.stock is not None and product.stock > 0:
             product.stock -= 1
+        # 로블록스: GitHub raw에서 계정 1개 지급
+        if product and "로블록스" in (product.title or ""):
+            assigned = assign_accounts_from_url(product, count=1)
+            if assigned:
+                order.delivered_account = assigned
+                flash("결제완료 처리 + 계정 지급 완료", "success")
+            else:
+                flash("결제완료 처리됨. (계정 목록 URL이 없거나 재고 계정이 부족합니다. 관리자에서 URL/목록 확인)", "error")
+        else:
+            flash("결제완료 처리했습니다. (재고 반영됨)", "success")
         db.session.commit()
-        flash("결제완료 처리했습니다. (재고 반영됨)", "success")
     return redirect("/admin")
 
 
@@ -692,6 +763,7 @@ def admin_product(pid=None):
             product.stock = int(request.form.get("stock") or 0)
         except ValueError:
             product.stock = 0
+        product.account_list_url = request.form.get("account_list_url","").strip()
         product.is_active = True
         f = request.files.get("pdf")
         if f and f.filename:
@@ -704,6 +776,7 @@ def admin_product(pid=None):
     dv = product.description if product else ""
     pv = product.price if product else ""
     sv = product.stock if product and product.stock is not None else 10
+    au = product.account_list_url if product else ""
     return render(f'''<div class="max-w-lg mx-auto bg-white rounded-xl border p-8">
     <h1 class="text-2xl font-bold mb-6">{'상품 수정' if product else '상품 추가'}</h1>
     <form method="post" enctype="multipart/form-data" class="space-y-4">
@@ -711,7 +784,10 @@ def admin_product(pid=None):
     <textarea name="description" rows="5" placeholder="설명" class="w-full border rounded-lg px-4 py-2">{dv}</textarea>
     <input name="price" type="number" value="{pv}" placeholder="가격" required class="w-full border rounded-lg px-4 py-2">
     <input name="stock" type="number" value="{sv}" placeholder="재고 수량" min="0" class="w-full border rounded-lg px-4 py-2">
-    <p class="text-xs text-gray-500 -mt-2">로블록스 계정 등은 재고를 정확히 입력하세요. 결제완료 처리 시 1개씩 차감됩니다.</p>
+    <p class="text-xs text-gray-500 -mt-2">로블록스 계정은 재고를 정확히 입력하세요. 결제완료 시 1개씩 차감됩니다.</p>
+    <input name="account_list_url" value="{au}" placeholder="GitHub raw 계정 목록 URL (로블록스용)" class="w-full border rounded-lg px-4 py-2">
+    <p class="text-xs text-gray-500 -mt-2">예: https://raw.githubusercontent.com/유저/repo/main/accounts.txt<br>
+    한 줄에 계정 하나 (예: 아이디:비번). #으로 시작하는 줄은 무시. 이미 지급된 줄은 건너뜀.</p>
     <input name="pdf" type="file" accept=".pdf" class="w-full">
     <button class="w-full bg-indigo-600 text-white py-3 rounded-lg">저장</button>
     </form></div>''')
