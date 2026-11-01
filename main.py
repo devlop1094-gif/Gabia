@@ -1,4 +1,3 @@
-# Daon Class - AI Chatbot + daonshop.cloud support
 import os, secrets, json
 from datetime import datetime
 from functools import wraps
@@ -150,6 +149,18 @@ class Order(db.Model):
 with app.app_context():
     db.create_all()
 
+    # 기존 DB에 stock 컬럼이 없으면 추가 (Render 등 기존 테이블 대응)
+    try:
+        from sqlalchemy import text, inspect
+        inspector = inspect(db.engine)
+        cols = [c["name"] for c in inspector.get_columns("product")]
+        if "stock" not in cols:
+            with db.engine.begin() as conn:
+                conn.execute(text("ALTER TABLE product ADD COLUMN stock INTEGER DEFAULT 999"))
+            print("[migrate] product.stock column added")
+    except Exception as e:
+        print(f"[migrate] stock column check/add skipped: {e}")
+
     # 관리자 계정 강제 생성/업데이트 (kimsiwoo / kimsiwoo)
     admin = User.query.filter_by(username="kimsiwoo").first()
     if not admin:
@@ -170,10 +181,15 @@ with app.app_context():
         ]:
             db.session.add(Product(title=t, description=d, price=p, stock=999))
         db.session.commit()
+
     # 기존 상품 stock이 None이면 기본값 채우기
-    for prod in Product.query.filter(Product.stock.is_(None)).all():
-        prod.stock = 999 if "로블록스" not in (prod.title or "") else 5
-    db.session.commit()
+    try:
+        for prod in Product.query.filter(Product.stock.is_(None)).all():
+            prod.stock = 999 if "로블록스" not in (prod.title or "") else 5
+        db.session.commit()
+    except Exception as e:
+        print(f"[migrate] stock default fill skipped: {e}")
+        db.session.rollback()
 
     # 로블록스 계정 상품 (없으면 추가)
     roblox_products = [
@@ -187,7 +203,6 @@ with app.app_context():
         if not existing:
             db.session.add(Product(title=t, description=d, price=p, stock=s))
         else:
-            # 기존 상품에 stock이 None이면 기본값 설정
             if existing.stock is None:
                 existing.stock = s
     db.session.commit()
