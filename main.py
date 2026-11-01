@@ -6,7 +6,6 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from openai import OpenAI
 
 # .env 지원 (선택)
 try:
@@ -51,56 +50,67 @@ BANK_NAME = "카카오뱅크"
 BANK_ACCOUNT = "7777-03-0806539"
 BANK_HOLDER = "김시우"
 
-# ===== AI 챗봇 설정 (xAI Grok 또는 OpenAI 호환) =====
-# 환경변수:
-#   XAI_API_KEY 또는 OPENAI_API_KEY
-#   OPENAI_BASE_URL (기본: https://api.x.ai/v1)
-#   OPENAI_MODEL (기본: grok-4.7 또는 gpt-4o-mini 등)
-XAI_API_KEY = os.environ.get("XAI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
-OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.x.ai/v1")
-OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "grok-4.7")
 
-openai_client = None
-if XAI_API_KEY:
-    openai_client = OpenAI(api_key=XAI_API_KEY, base_url=OPENAI_BASE_URL)
+# ===== 상담 봇 (규칙 기반 FAQ - API 크레딧 없음) =====
+FAQ_RESPONSES = [
+    {
+        "keywords": ["입금", "계좌", "은행", "송금", "무통장", "결제 방법", "결제방법", "어떻게 내", "돈"],
+        "reply": "무통장 입금으로 결제해 주세요.\n\n🏦 은행: 카카오뱅크\n계좌번호: 7777-03-0806539\n예금주: 김시우\n\n금액을 정확히 입금해 주시면 확인 후 '내 강의'에서 PDF를 받으실 수 있습니다."
+    },
+    {
+        "keywords": ["가격", "얼마", "비용", "금액", "원"],
+        "reply": "현재 판매 중인 강의 가격은 다음과 같습니다.\n\n• 유튜브 100만 기법 - 99,000원\n• 1달 300 기법 - 79,000원\n• 엑셀 업무 자동화 - 59,000원\n• 네이버 블로그 자동화 - 69,000원\n\n상세 페이지에서 확인하실 수 있어요!"
+    },
+    {
+        "keywords": ["유튜브", "100만", "구독"],
+        "reply": "「유튜브 100만 기법」은 유튜브 채널을 100만 구독자까지 성장시키는 실전 기법 강의입니다.\n가격: 99,000원\n\n구매 후 PDF로 바로 받아보실 수 있어요."
+    },
+    {
+        "keywords": ["1달", "300", "한달"],
+        "reply": "「1달 300 기법」은 단 한 달 만에 결과를 만드는 300가지 실전 기법 강의입니다.\n가격: 79,000원"
+    },
+    {
+        "keywords": ["엑셀", "자동화", "업무"],
+        "reply": "「엑셀 업무 자동화」는 반복되는 엑셀 업무를 자동화하는 실무 테크닉 강의입니다.\n가격: 59,000원"
+    },
+    {
+        "keywords": ["네이버", "블로그"],
+        "reply": "「네이버 블로그 자동화」는 네이버 블로그 운영을 자동화해서 트래픽과 수익을 만드는 방법 강의입니다.\n가격: 69,000원"
+    },
+    {
+        "keywords": ["구매", "사는법", "사는 방법", "어떻게 사", "주문"],
+        "reply": "구매 방법:\n1. 회원가입 / 로그인\n2. 원하는 강의 '상세보기' → '구매하기'\n3. 안내된 계좌로 입금\n4. 관리자 확인 후 '내 강의'에서 PDF 다운로드\n\n이미 구매한 강의는 다시 구매할 수 없습니다."
+    },
+    {
+        "keywords": ["pdf", "다운로드", "다운", "파일"],
+        "reply": "결제(입금)가 확인되면 '내 강의' 메뉴에서 PDF를 다운로드할 수 있습니다.\n아직 입금 대기 중이라면 조금만 기다려 주세요!"
+    },
+    {
+        "keywords": ["로그인", "회원가입", "가입", "계정"],
+        "reply": "우측 상단에서 '회원가입' 또는 '로그인'을 할 수 있습니다.\n가입 후 강의를 구매하고 '내 강의'에서 PDF를 받으세요."
+    },
+    {
+        "keywords": ["관리자", "문의", "연락", "고객센터", "헬프"],
+        "reply": "추가 문의가 필요하시면 관리자에게 직접 문의해 주세요.\n입금 확인이나 특별한 요청은 관리자 확인이 필요합니다."
+    },
+    {
+        "keywords": ["안녕", "하이", "헬로", "ㅎㅇ", "안녕하세요"],
+        "reply": "안녕하세요! 다온 클래스 상담봇입니다 😊\n강의 안내, 가격, 입금 방법, 구매 방법 등 궁금한 점을 편하게 물어보세요."
+    },
+]
 
-# 상품 정보를 시스템 프롬프트에 넣기 위한 헬퍼
-def get_products_info():
-    products = Product.query.filter_by(is_active=True).all()
-    if not products:
-        return "현재 등록된 강의가 없습니다."
-    lines = []
-    for p in products:
-        lines.append(f"- {p.title}: {p.price:,}원 / {p.description or '설명 없음'}")
-    return "\n".join(lines)
+DEFAULT_REPLY = "죄송해요, 정확히 이해하지 못했어요.\n\n이런 내용을 물어보실 수 있어요:\n• 입금 / 계좌번호\n• 강의 가격\n• 구매 방법\n• PDF 다운로드\n• 특정 강의 소개\n\n다시 한 번 물어봐 주세요!"
 
-SYSTEM_PROMPT_TEMPLATE = """당신은 '다온 클래스'의 친절한 AI 상담 봇입니다.
-사이트: https://daonshop.cloud
-역할: 강의 안내, 구매 방법 설명, 입금 안내, 자주 묻는 질문 답변.
+def get_bot_reply(message: str) -> str:
+    msg = (message or "").lower().strip()
+    if not msg:
+        return DEFAULT_REPLY
+    for item in FAQ_RESPONSES:
+        for kw in item["keywords"]:
+            if kw in msg:
+                return item["reply"]
+    return DEFAULT_REPLY
 
-[현재 판매 중인 강의]
-{products}
-
-[결제 방법 - 매우 중요]
-- 무통장 입금만 가능합니다.
-- 은행: {bank_name}
-- 계좌번호: {bank_account}
-- 예금주: {bank_holder}
-- 입금 후 관리자가 확인하면 '내 강의'에서 PDF를 다운로드할 수 있습니다.
-
-[사이트 이용 안내]
-- 회원가입/로그인 후 강의를 구매할 수 있습니다.
-- 이미 구매한 강의는 다시 구매할 수 없습니다.
-- PDF는 결제 완료 후 '내 강의' 메뉴에서 다운로드합니다.
-- 관리자 문의가 필요하면 "관리자에게 문의해 주세요"라고 안내하세요.
-
-답변 규칙:
-1. 항상 한국어로 친절하고 간결하게 답변하세요.
-2. 가격, 계좌번호 등 정확한 정보를 그대로 사용하세요.
-3. 모르는 내용은 추측하지 말고 "자세한 내용은 관리자에게 문의해 주세요"라고 하세요.
-4. 응원과 격려를 섞어 친근하게 대화하세요.
-5. 답변은 너무 길지 않게 3~6문장 정도로 유지하세요.
-"""
 
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -584,7 +594,7 @@ def api_health():
         "status": "ok",
         "service": "daon-class-api",
         "domain": "daonshop.cloud",
-        "chat_enabled": bool(openai_client),
+        "chat_enabled": True,
         "time": datetime.utcnow().isoformat() + "Z"
     })
 
@@ -603,68 +613,15 @@ def api_products():
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
-    """실시간 AI 상담 봇 API
-    POST JSON: {"message": "질문", "history": [{"role":"user","content":"..."}, ...]}
-    """
-    if not openai_client:
-        return jsonify({
-            "error": "AI 상담 봇이 설정되지 않았습니다. 관리자에게 XAI_API_KEY 또는 OPENAI_API_KEY를 설정해 달라고 요청하세요."
-        }), 503
-
+    """규칙 기반 상담 봇 (API 크레딧 없음)"""
     data = request.get_json(silent=True) or {}
     message = (data.get("message") or "").strip()
-    history = data.get("history") or []
-
     if not message:
         return jsonify({"error": "메시지를 입력해 주세요."}), 400
-
-    # 시스템 프롬프트 생성
-    try:
-        products_info = get_products_info()
-    except Exception:
-        products_info = "강의 정보를 불러올 수 없습니다."
-
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        products=products_info,
-        bank_name=BANK_NAME,
-        bank_account=BANK_ACCOUNT,
-        bank_holder=BANK_HOLDER,
-    )
-
-    messages = [{"role": "system", "content": system_prompt}]
-
-    # 히스토리 정리 (최근 것만, 역할 검증)
-    for h in history[-8:]:
-        role = h.get("role")
-        content = (h.get("content") or "").strip()
-        if role in ("user", "assistant") and content:
-            messages.append({"role": role, "content": content})
-
-    # 현재 메시지 추가 (중복 방지)
-    if not messages or messages[-1].get("content") != message:
-        messages.append({"role": "user", "content": message})
-
-    try:
-        resp = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=messages,
-            max_tokens=600,
-            temperature=0.7,
-        )
-        reply = resp.choices[0].message.content.strip()
-        return jsonify({
-            "reply": reply,
-            "model": OPENAI_MODEL,
-        })
-    except Exception as e:
-        # 키 오류나 네트워크 오류 등을 사용자 친화적으로
-        err_msg = str(e)
-        if "api_key" in err_msg.lower() or "authentication" in err_msg.lower():
-            return jsonify({"error": "AI 서비스 인증에 실패했습니다. 관리자에게 문의해 주세요."}), 503
-        return jsonify({"error": "상담 봇 응답 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해 주세요."}), 500
+    reply = get_bot_reply(message)
+    return jsonify({"reply": reply, "model": "faq-bot"})
 
 
-# 간단한 공개 정보 API (api.daonshop.cloud에서 사용 가능)
 @app.route("/api/info")
 def api_info():
     return jsonify({
