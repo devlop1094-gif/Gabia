@@ -1,10 +1,12 @@
 """
 Euana - Single File (Render Ready)
-- Register / Login
-- Bank transfer / Crypto payment
-- Credit system
-- Server-side obfuscation + dashboard result
-- Multiple obfuscation options
+- 회원가입 / 로그인
+- 한국인 → KakaoBank 계좌이체
+- 외국인 → 코인 (추후 주소)
+- 크레딧 시스템
+- 서버 난독화 + 대시보드 결과 표시
+- 한/영 토글
+- 다양한 난독화 옵션
 """
 
 from fastapi import FastAPI, Request, Form, UploadFile, File
@@ -39,8 +41,9 @@ CRYPTO_INFO = {
 }
 
 # Admin
-ADMIN_USERNAME = "kimsiwoo"
-ADMIN_PASSWORD = "kimsiwoo"
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "admin1234"  # 배포 전 꼭 변경
+admin_sessions = set()
 
 # v1 / v2 both cost 3 credits; v2 uses stronger pipeline
 BASE_COST = {
@@ -50,156 +53,109 @@ BASE_COST = {
 
 OPTION_COST = {}  # options baked into v1/v2
 
-# ======================
-# Database (PostgreSQL via DATABASE_URL)
-# ======================
-import json
-import psycopg2
-import psycopg2.extras
 
-DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("DB_URL") or os.environ.get("POSTGRES_URL")
-
-class _DBConn:
-    """Thin wrapper so conn.execute(...).fetchone() style works with psycopg2."""
-    def __init__(self, conn):
-        self._conn = conn
-        self._cur = conn.cursor()
-
-    def execute(self, sql, params=None):
-        # Convert SQLite-style ? placeholders to psycopg2 %s
-        if params is not None and "?" in sql:
-            sql = sql.replace("?", "%s")
-        self._cur.execute(sql, params or ())
-        return self
-
-    def fetchone(self):
-        return self._cur.fetchone()
-
-    def fetchall(self):
-        return self._cur.fetchall()
-
-    def commit(self):
-        self._conn.commit()
-
-    def close(self):
-        try:
-            self._cur.close()
-        except Exception:
-            pass
-        self._conn.close()
-
-
-def get_db():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL env var is not set. Add it in Render Environment.")
-    # Render sometimes gives postgres:// — psycopg2 wants postgresql://
-    url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    raw = psycopg2.connect(url, cursor_factory=psycopg2.extras.RealDictCursor)
-    return _DBConn(raw)
-
-def init_db():
-    conn = get_db()
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            username TEXT PRIMARY KEY,
-            password TEXT NOT NULL,
-            credits INTEGER NOT NULL DEFAULT 0,
-            results TEXT DEFAULT '{}',
-            created_at TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
-            username TEXT NOT NULL,
-            created_at TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS admin_sessions (
-            token TEXT PRIMARY KEY,
-            created_at TEXT
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS payments (
-            payment_id TEXT PRIMARY KEY,
-            username TEXT NOT NULL,
-            method TEXT,
-            amount INTEGER,
-            credits INTEGER,
-            krw_value DOUBLE PRECISION,
-            status TEXT DEFAULT 'pending',
-            depositor_name TEXT,
-            tx_hash TEXT,
-            created_at TEXT,
-            submitted_at TEXT,
-            approved_at TEXT,
-            rejected_at TEXT,
-            approved_by TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-# Init only when DATABASE_URL is present (skip at import time if missing for local syntax checks)
-if DATABASE_URL:
-    try:
-        init_db()
-    except Exception as e:
-        print(f"[DB] init deferred/failed: {e}")
+users_db = {}
+sessions = {}
+pending_payments = {}
 
 # ======================
 # Language
 # ======================
 
 LANG = {
-    "app_name": "Euana",
-    "welcome": "Welcome to Euana",
-    "register": "Sign Up",
-    "login": "Login",
-    "logout": "Logout",
-    "username": "Username",
-    "password": "Password",
-    "balance": "Credit Balance",
-    "charge": "Charge Credits",
-    "obfuscate": "Obfuscate",
-    "bank_transfer": "Bank Transfer",
-    "crypto": "Crypto Payment",
-    "select_amount": "Amount",
-    "after_transfer": "After payment, enter depositor name or TxHash and confirm",
-    "depositor_name": "Depositor Name",
-    "tx_hash": "Transaction Hash (TxID)",
-    "confirm_payment": "Submit Payment Proof",
-    "insufficient_credit": "Insufficient credits. Please charge.",
-    "obfuscate_success": "Obfuscation completed",
-    "result": "Obfuscation Result",
-    "copy": "Copy",
-    "dashboard": "Dashboard",
-    "code_placeholder": "Paste your Luau / Lua code here",
-    "intensity": "Base Intensity",
-    "basic": "Basic",
-    "strong": "Strong",
-    "extreme": "Extreme",
-    "submit": "Run",
-    "payment_submitted": "Payment proof submitted. Credits will be added after verification.",
-    "already_exists": "Username already exists",
-    "invalid_login": "Invalid username or password",
-    "options": "Extra Options",
-    "opt_rename": "Rename Variables / Functions",
-    "opt_strings": "Encrypt Strings",
-    "opt_cff": "Control Flow Flattening",
-    "opt_dead": "Insert Dead Code",
-    "opt_junk": "Insert Junk Code",
-    "opt_tamper": "Anti-Tamper",
-    "opt_minify": "Minify (remove comments/whitespace)",
-    "opt_opaque": "Opaque Predicates",
-    "opt_proxy": "Proxy Functions",
-    "opt_numbers": "Encrypt Numbers",
+    "ko": {
+        "app_name": "Euana",
+        "welcome": "Euana에 오신 것을 환영합니다",
+        "register": "회원가입",
+        "login": "로그인",
+        "logout": "로그아웃",
+        "username": "아이디",
+        "password": "비밀번호",
+        "balance": "보유 크레딧",
+        "charge": "크레딧 충전",
+        "obfuscate": "난독화 하기",
+        "bank_transfer": "계좌이체",
+        "crypto": "코인 결제",
+        "select_amount": "충전 금액",
+        "after_transfer": "입금 후 Depositor name 또는 TxHash를 입력하고 확인을 눌러주세요",
+        "depositor_name": "Depositor name",
+        "tx_hash": "트랜잭션 해시 (TxID)",
+        "confirm_payment": "결제 확인 요청",
+        "insufficient_credit": "크레딧이 부족합니다. 충전이 필요합니다.",
+        "obfuscate_success": "난독화가 완료되었습니다",
+        "result": "난독화 결과",
+        "copy": "복사하기",
+        "dashboard": "대시보드",
+        "code_placeholder": "여기에 Luau / Lua 코드를 붙여넣으세요",
+        "intensity": "기본 강도",
+        "basic": "Basic",
+        "strong": "Strong",
+        "extreme": "Extreme",
+        "submit": "실행",
+        "payment_submitted": "결제 확인 요청이 접수되었습니다. 확인 후 크레딧이 지급됩니다.",
+        "already_exists": "이미 존재하는 아이디입니다",
+        "invalid_login": "아이디 또는 비밀번호가 올바르지 않습니다",
+        "options": "추가 옵션",
+        "opt_rename": "변수/함수 이름 섞기",
+        "opt_strings": "문자열 암호화",
+        "opt_cff": "Control Flow Flattening",
+        "opt_dead": "Dead Code 삽입",
+        "opt_junk": "Junk Code 삽입",
+        "opt_tamper": "Anti-Tamper",
+        "opt_minify": "공백/주석 제거",
+        "opt_opaque": "Opaque Predicates",
+        "opt_proxy": "Proxy Functions",
+        "opt_numbers": "숫자 암호화",
+    },
+    "en": {
+        "app_name": "Euana",
+        "welcome": "Welcome to Euana",
+        "register": "Sign Up",
+        "login": "Login",
+        "logout": "Logout",
+        "username": "Username",
+        "password": "Password",
+        "balance": "Credit Balance",
+        "charge": "Charge Credits",
+        "obfuscate": "Obfuscate",
+        "bank_transfer": "Bank Transfer",
+        "crypto": "Crypto Payment",
+        "select_amount": "Amount",
+        "after_transfer": "After payment, enter depositor name or TxHash and confirm",
+        "depositor_name": "Depositor Name",
+        "tx_hash": "Transaction Hash (TxID)",
+        "confirm_payment": "Submit Payment Proof",
+        "insufficient_credit": "Insufficient credits. Please charge.",
+        "obfuscate_success": "Obfuscation completed",
+        "result": "Obfuscation Result",
+        "copy": "Copy",
+        "dashboard": "Dashboard",
+        "code_placeholder": "Paste your Luau / Lua code here",
+        "intensity": "Base Intensity",
+        "basic": "Basic",
+        "strong": "Strong",
+        "extreme": "Extreme",
+        "submit": "Run",
+        "payment_submitted": "Payment proof submitted. Credits will be added after verification.",
+        "already_exists": "Username already exists",
+        "invalid_login": "Invalid username or password",
+        "options": "Extra Options",
+        "opt_rename": "Rename Variables / Functions",
+        "opt_strings": "Encrypt Strings",
+        "opt_cff": "Control Flow Flattening",
+        "opt_dead": "Insert Dead Code",
+        "opt_junk": "Insert Junk Code",
+        "opt_tamper": "Anti-Tamper",
+        "opt_minify": "Minify (remove comments/whitespace)",
+        "opt_opaque": "Opaque Predicates",
+        "opt_proxy": "Proxy Functions",
+        "opt_numbers": "Encrypt Numbers",
+    }
 }
 
 def t(key: str, lang: str = "en") -> str:
-    return LANG.get(key, key)
+    # English only
+    return LANG.get("en", {}).get(key, key)
 
 # ======================
 # Helpers
@@ -213,32 +169,9 @@ def create_token() -> str:
 
 def get_current_user(request: Request):
     token = request.cookies.get("session")
-    if not token:
+    if not token or token not in sessions:
         return None
-    conn = get_db()
-    row = conn.execute("SELECT username FROM sessions WHERE token=?", (token,)).fetchone()
-    if not row:
-        conn.close()
-        return None
-    user_row = conn.execute("SELECT * FROM users WHERE username=?", (row["username"],)).fetchone()
-    conn.close()
-    if not user_row:
-        return None
-    user = dict(user_row)
-    try:
-        user["results"] = json.loads(user.get("results") or "{}")
-    except Exception:
-        user["results"] = {}
-    return user
-
-def save_user(user: dict):
-    conn = get_db()
-    conn.execute(
-        "UPDATE users SET credits=?, results=? WHERE username=?",
-        (user["credits"], json.dumps(user.get("results", {})), user["username"])
-    )
-    conn.commit()
-    conn.close()
+    return users_db.get(sessions[token])
 
 def calc_credits(amount: float, method: str = "ltc") -> int:
     # amount is credits to buy
@@ -249,188 +182,172 @@ def rand_name(length: int = 8) -> str:
 
 
 # ======================
-# Obfuscation Engine (Custom VM – no recoverable plaintext / no plain XOR)
+# Obfuscation Engine (with simple VM)
 # ======================
+
+def _xor_string(s: str, key: int = 0x5A) -> str:
+    encoded = "".join(chr(ord(c) ^ key) for c in s)
+    encoded = encoded.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "")
+    return encoded
+
+def _make_string_decryptor(key: int = 0x5A) -> str:
+    return f"local function _S(s)local r=''for i=1,#s do r=r..string.char(string.byte(s,i)~{key})end return r end"
+
+def _encrypt_number(n: int) -> str:
+    a = random.randint(17, 97)
+    b = n + a
+    return f"({b}-{a})"
 
 def _rand_ident(n: int = 8) -> str:
     return "_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
-
-def _pack_source_to_ints(src: str, seed: int) -> list:
-    """Pack UTF-8 bytes into 32-bit ints with a rolling keystream (not plain XOR)."""
-    data = src.encode("utf-8")
-    out = []
-    state = seed & 0xFFFFFFFF
-    i = 0
-    while i < len(data):
-        # LCG-ish keystream
-        state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
-        chunk = 0
-        for b in range(4):
-            if i + b < len(data):
-                # mix byte with keystream byte and position
-                kb = (state >> (8 * b)) & 0xFF
-                chunk |= ((data[i + b] ^ kb ^ ((i + b) & 0xFF)) & 0xFF) << (8 * b)
-        out.append(chunk)
-        i += 4
-    return out, len(data)
-
-
-def _emit_vm(src: str, intensity: str) -> str:
+def _generate_vm(bytecode: list, intensity: str) -> str:
     """
-    Emit a custom stack VM that:
-    1. Holds packed integer bytecode
-    2. Reconstructs the original source through multi-step decode (not a single XOR loop)
-    3. Runs it via loadstring / load
-    Source never appears as a single encrypted string literal.
+    Simple stack-based VM wrapper.
+    bytecode items: ("PUSHSTR", str), ("PUSHNUM", int), ("CALL", name), ("RET",)
     """
-    seed = random.randint(0x100000, 0x7FFFFFFF)
-    packed, nbytes = _pack_source_to_ints(src, seed)
+    pc_name = _rand_ident(5)
+    stack_name = _rand_ident(5)
+    code_name = _rand_ident(6)
+    op_name = _rand_ident(4)
 
-    # split packed ints into several tables to avoid one big array
-    chunk_size = random.randint(8, 16)
-    tables = []
-    for i in range(0, len(packed), chunk_size):
-        tables.append(packed[i:i + chunk_size])
+    # Encode strings in bytecode
+    key = random.randint(0x20, 0x7F)
+    encrypted_chunks = []
+    for item in bytecode:
+        if item[0] == "PUSHSTR":
+            encrypted_chunks.append((_xor_string(item[1], key), "str"))
+        elif item[0] == "PUSHNUM":
+            encrypted_chunks.append((str(item[1]), "num"))
+        else:
+            encrypted_chunks.append((item[0], "op"))
 
-    # random names
-    n = {
-        "pc": _rand_ident(5),
-        "st": _rand_ident(5),
-        "bc": _rand_ident(6),
-        "op": _rand_ident(4),
-        "acc": _rand_ident(5),
-        "key": _rand_ident(4),
-        "buf": _rand_ident(5),
-        "len": _rand_ident(4),
-        "i": _rand_ident(3),
-        "j": _rand_ident(3),
-        "t": _rand_ident(4),
-        "fn": _rand_ident(4),
-        "err": _rand_ident(4),
-        "tmp": _rand_ident(4),
-        "run": _rand_ident(5),
-    }
+    # Build data table
+    data_lines = []
+    for i, (val, typ) in enumerate(encrypted_chunks):
+        if typ == "str":
+            data_lines.append(f"[{i+1}]=_S('{val}')")
+        elif typ == "num":
+            data_lines.append(f"[{i+1}]={val}")
+        else:
+            data_lines.append(f"[{i+1}]='{val}'")
 
-    # build bytecode table pieces
-    tbl_parts = []
-    for ti, tbl in enumerate(tables):
-        vals = ",".join(str(x) for x in tbl)
-        tbl_parts.append(f"{{{vals}}}")
-    bc_init = ",".join(tbl_parts)
+    data_tbl = ",".join(data_lines)
 
-    # VM program as data-driven ops:
-    # opcodes (numeric to avoid string opcodes):
-    # 1 = LOAD_CHUNK (push table index)
-    # 2 = DECODE_BLOCK (pop table, decode into buf using keystream)
-    # 3 = FINISH (join buf -> string, load+run)
-    # 0 = NOP / junk
-    # We hardcode the control flow in Lua with opaque checks
-
-    # opaque predicate helpers
-    opaque_true = f"(function() local a={random.randint(2,9)} return a*a>=0 end)()"
-    opaque_false = f"(function() local a={random.randint(2,9)} return a*a<0 end)()"
-
-    # anti-tamper light
-    anti = ""
-    if intensity == "v2":
-        anti = f"""
-local {n['tmp']}=os and os.clock and os.clock() or 0
-if type(debug)=="table" and debug.getinfo then local _=debug.getinfo(1,"S") end
-"""
-
-    # Build decode loop that reconstructs bytes from packed ints using same LCG
-    vm = f"""{anti}local {n['bc']}={{{bc_init}}}
-local {n['buf']}={{}}
-local {n['key']}={seed}
-local {n['len']}={nbytes}
-local {n['i']}=1
-local {n['j']}=0
-while {n['i']}<=#{n['bc']} do
-local {n['t']}={n['bc']}[{n['i']}]
-{n['i']}={n['i']}+1
-if type({n['t']})=="table" then
-local {n['pc']}=1
-while {n['pc']}<=#{n['t']} do
-local {n['op']}={n['t']}[{n['pc']}]
-{n['pc']}={n['pc']}+1
-{n['key']}=({n['key']}*1664525+1013904223)%4294967296
-for {n['acc']}=0,3 do
-if {n['j']}<{n['len']} then
-local div=1
-for _=1,{n['acc']} do div=div*256 end
-local kb=math.floor({n['key']}/div)%256
-local b=math.floor({n['op']}/div)%256
-local x=b
-local y=kb
-local z={n['j']}%256
-local r=0
-local p=1
-for _=1,8 do
-local bb=x%2
-local yb=y%2
-local zb=z%2
-local bit=((bb+yb+zb)%2)
-r=r+bit*p
-x=math.floor(x/2)
-y=math.floor(y/2)
-z=math.floor(z/2)
-p=p*2
+    vm = f"""
+{_make_string_decryptor(key)}
+local {code_name}={{{data_tbl}}}
+local {stack_name}={{}}
+local {pc_name}=1
+while {pc_name}<=#{code_name} do
+local {op_name}={code_name}[{pc_name}]
+{pc_name}={pc_name}+1
+if type({op_name})=="string" and #{op_name}>3 and string.sub({op_name},1,1)~="_" then
+-- opcode
+if {op_name}=="CALL" then
+local fn=table.remove({stack_name})
+local arg=table.remove({stack_name})
+if type(fn)=="function" then fn(arg) end
+elseif {op_name}=="RET" then break
 end
-{n['j']}={n['j']}+1
-{n['buf']}[{n['j']}]=r
+else
+table.insert({stack_name},{op_name})
 end
-end
-end
-end
-end
-local {n['run']}=""
-for {n['i']}=1,{n['len']} do
-{n['run']}={n['run']}..string.char({n['buf']}[{n['i']}])
-end
-local {n['fn']},{n['err']}=(load or loadstring)({n['run']})
-if not {n['fn']} then error({n['err']}) end
-if {opaque_true} then
-{n['fn']}()
 end
 """
-    # minify-ish: strip pure empty lines but keep structure
-    lines = [ln.rstrip() for ln in vm.splitlines() if ln.strip()]
-    return "\n".join(lines)
-
+    return vm.strip()
 
 def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
-    code = (code or "").strip()
-    if not code:
-        return "-- empty"
-
-    if intensity not in ("v1", "v2"):
-        intensity = "v2"
-
-    # light cleanup only – do not leave readable structure
-    # remove comments
-    cleaned = []
-    for line in code.splitlines():
-        s = line.strip()
-        if s.startswith("--"):
-            continue
-        cleaned.append(line)
-    src = "\n".join(cleaned)
-
-    # For v1: single VM layer; v2: double-wrap (VM of a minified bootstrap)
-    body = _emit_vm(src, intensity)
-
-    if intensity == "v2":
-        # wrap again so outer layer is also VM bytecode
-        body = _emit_vm(body, "v1")
-
+    result = code
+    opts = set(options or [])
     header = [
-        f"-- obfuscated by {APP_NAME} {VERSION}",
-        f"-- {datetime.utcnow().isoformat()}Z | {intensity}",
+        f"-- This file was obfuscated by Euana.",
+        f"-- https://daonshop.cloud",
+        f"-- version: {intensity} | {APP_NAME} {VERSION}",
+        f"-- {datetime.utcnow().isoformat()}Z",
         "",
     ]
-    return "\n".join(header) + body
 
+    # v1 = standard, v2 = upgraded pipeline
+    if intensity == "v1":
+        opts.update(["rename_vars", "encrypt_strings", "junk_code", "minify"])
+    else:  # v2
+        opts.update(["rename_vars", "encrypt_strings", "cff", "dead_code", "junk_code", "number_encrypt", "opaque_predicates", "anti_tamper", "proxy_functions"])
+        intensity = "v2"
+
+    if "minify" in opts:
+        lines = []
+        for line in result.splitlines():
+            s = line.strip()
+            if s.startswith("--") or not s:
+                continue
+            lines.append(s)
+        result = " ".join(lines)
+
+    if "rename_vars" in opts:
+        mapping = {}
+        def ren(m):
+            name = m.group(1)
+            if name not in mapping:
+                mapping[name] = _rand_ident(7)
+            return "local " + mapping[name]
+        result = re.sub(r"\blocal\s+([a-zA-Z_][a-zA-Z0-9_]*)", ren, result)
+
+    if "encrypt_strings" in opts:
+        key = 0x5A
+        decryptor = _make_string_decryptor(key)
+        def str_enc(m):
+            content = m.group(2)
+            if len(content) < 1:
+                return m.group(0)
+            return f"_S('{_xor_string(content, key)}')"
+        result = re.sub(r"(['\"])(.*?)\1", str_enc, result)
+        result = decryptor + chr(10) + result
+
+    if "number_encrypt" in opts:
+        def num_enc(m):
+            n = int(m.group(0))
+            return _encrypt_number(n) if n > 9 else m.group(0)
+        result = re.sub(r"\b\d{2,}\b", num_enc, result)
+
+    if "dead_code" in opts:
+        dead_snippets = ["if false then local _d=1 end", "do local _x=nil end", "if 1>2 then return end"]
+        lines = result.splitlines() or [result]
+        for _ in range(min(5, max(2, len(lines)//3))):
+            lines.insert(random.randint(0, len(lines)), random.choice(dead_snippets))
+        result = chr(10).join(lines)
+
+    if "junk_code" in opts:
+        junk_snippets = [f"local {_rand_ident()}=math.random()", f"local {_rand_ident()}=os.clock()", f"local {_rand_ident()}={{}}"]
+        lines = result.splitlines() or [result]
+        for _ in range(min(4, max(2, len(lines)//4))):
+            lines.insert(random.randint(0, len(lines)), random.choice(junk_snippets))
+        result = chr(10).join(lines)
+
+    if "opaque_predicates" in opts:
+        result = result.replace("if ", "if (function() return true end)() and ", 1)
+
+    if "proxy_functions" in opts:
+        p = _rand_ident(6)
+        result = f"local {p}=function(f,...)return f(...)end" + chr(10) + result
+
+    if "anti_tamper" in opts:
+        result = "local _t0=os.clock()" + chr(10) + "if debug and debug.getinfo then local _=debug.getinfo(1) end" + chr(10) + result
+
+    if "cff" in opts:
+        result = "local _st=0" + chr(10) + "while true do" + chr(10) + "if _st==0 then" + chr(10) + result + chr(10) + "_st=1" + chr(10) + "elseif _st==1 then break end" + chr(10) + "end"
+
+    if intensity == "v2":
+        key = random.randint(0x30, 0x6F)
+        payload = _xor_string(result, key)
+        result = (
+            _make_string_decryptor(key) + chr(10)
+            + f"local _bc=_S('{payload}')" + chr(10)
+            + "local _fn,err=loadstring(_bc)" + chr(10)
+            + "if _fn then _fn() else error(err) end"
+        )
+
+    return chr(10).join(header) + result
 
 
 def calc_cost(intensity: str, options: List[str] = None) -> int:
@@ -488,6 +405,8 @@ label{{font-size:13px;color:#94a3b8}}
 <header>
   <h1>{APP_NAME}</h1>
   <div class="nav">
+    <a href="/?lang=en">한국어</a>
+    <a href="/?lang=en">English</a>
     {nav_user}
   </div>
 </header>
@@ -536,22 +455,20 @@ async def register_page(lang: str = "en"):
 @app.post("/register")
 async def register(username: str = Form(...), password: str = Form(...), lang: str = Form("en")):
     username = username.strip().lower()
-    conn = get_db()
-    exists = conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone()
-    if exists:
-        conn.close()
+    if username in users_db:
         content = f"""<div class="card"><p class="error">{t('already_exists', lang)}</p>
         <a class="btn" href="/register?lang={lang}">{t('register', lang)}</a></div>"""
         return HTMLResponse(base_html(content, lang))
-    created = datetime.utcnow().isoformat()
-    conn.execute(
-        "INSERT INTO users (username, password, credits, results, created_at) VALUES (?,?,?,?,?)",
-        (username, hash_password(password), 0, "{}", created)
-    )
+    users_db[username] = {
+        "username": username,
+        "password": hash_password(password),
+        "credits": 3,
+        "lang": lang,
+        "results": {},
+        "created_at": datetime.utcnow().isoformat(),
+    }
     token = create_token()
-    conn.execute("INSERT INTO sessions (token, username, created_at) VALUES (?,?,?)", (token, username, created))
-    conn.commit()
-    conn.close()
+    sessions[token] = username
     resp = RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
     resp.set_cookie("session", token, httponly=True, max_age=60*60*24*30)
     return resp
@@ -576,17 +493,13 @@ async def login_page(lang: str = "en"):
 @app.post("/login")
 async def login(username: str = Form(...), password: str = Form(...), lang: str = Form("en")):
     username = username.strip().lower()
-    conn = get_db()
-    user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    user = users_db.get(username)
     if not user or user["password"] != hash_password(password):
-        conn.close()
         content = f"""<div class="card"><p class="error">{t('invalid_login', lang)}</p>
         <a class="btn" href="/login?lang={lang}">{t('login', lang)}</a></div>"""
         return HTMLResponse(base_html(content, lang))
     token = create_token()
-    conn.execute("INSERT INTO sessions (token, username, created_at) VALUES (?,?,?)", (token, username, datetime.utcnow().isoformat()))
-    conn.commit()
-    conn.close()
+    sessions[token] = username
     resp = RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
     resp.set_cookie("session", token, httponly=True, max_age=60*60*24*30)
     return resp
@@ -594,11 +507,8 @@ async def login(username: str = Form(...), password: str = Form(...), lang: str 
 @app.get("/logout")
 async def logout(request: Request):
     token = request.cookies.get("session")
-    if token:
-        conn = get_db()
-        conn.execute("DELETE FROM sessions WHERE token=?", (token,))
-        conn.commit()
-        conn.close()
+    if token in sessions:
+        del sessions[token]
     resp = RedirectResponse("/", status_code=302)
     resp.delete_cookie("session")
     return resp
@@ -704,7 +614,6 @@ async def do_obfuscate(
     if "results" not in user:
         user["results"] = {}
     user["results"][result_id] = result
-    save_user(user)
 
     return RedirectResponse(f"/dashboard?lang={lang}&result_id={result_id}", status_code=302)
 
@@ -730,17 +639,17 @@ async def create_charge(
     payment_id = str(uuid.uuid4())[:8]
     # Reference KRW value for display only
     krw_value = (credits_buy / 3) * KRW_PER_3_CREDITS
-    created = datetime.utcnow().isoformat()
 
-    conn = get_db()
-    conn.execute(
-        """INSERT INTO payments
-           (payment_id, username, method, amount, credits, krw_value, status, created_at)
-           VALUES (?,?,?,?,?,?,?,?)""",
-        (payment_id, user["username"], "ltc", credits_buy, credits_buy, krw_value, "pending", created)
-    )
-    conn.commit()
-    conn.close()
+    pending_payments[payment_id] = {
+        "payment_id": payment_id,
+        "username": user["username"],
+        "method": "ltc",
+        "amount": credits_buy,
+        "credits": credits_buy,
+        "krw_value": krw_value,
+        "status": "pending",
+        "created_at": datetime.utcnow().isoformat(),
+    }
 
     body = f"""
     <div class="card">
@@ -775,22 +684,21 @@ async def confirm_payment(
     if not user:
         return RedirectResponse(f"/login?lang={lang}", status_code=302)
 
-    conn = get_db()
-    row = conn.execute("SELECT * FROM payments WHERE payment_id=?", (payment_id,)).fetchone()
-    if not row or row["username"] != user["username"]:
-        conn.close()
+    payment = pending_payments.get(payment_id)
+    if not payment or payment["username"] != user["username"]:
         return RedirectResponse(f"/dashboard?lang={lang}&error=Payment not found", status_code=302)
 
-    payment = dict(row)
     if payment["status"] == "pending":
-        conn.execute(
-            "UPDATE payments SET depositor_name=?, tx_hash=?, submitted_at=? WHERE payment_id=?",
-            (depositor_name, tx_hash, datetime.utcnow().isoformat(), payment_id)
-        )
-        conn.commit()
-    conn.close()
+        payment["status"] = "pending"  # stays pending until admin approves
+        payment["depositor_name"] = depositor_name
+        payment["tx_hash"] = tx_hash
+        payment["submitted_at"] = datetime.utcnow().isoformat()
+        # credits added only after /admin approve
 
-    msg = "Payment proof submitted. Credits will be added after admin approval."
+    msg = {
+        "ko": "Payment proof submitted. Credits will be added after admin approval.",
+        "en": "Payment proof submitted. Credits will be added after admin approval."
+    }.get(lang, "Submitted. Waiting for admin approval.")
 
     content = f"""
     <div class="card">
@@ -809,12 +717,9 @@ async def confirm_payment(
 
 def get_admin(request: Request):
     token = request.cookies.get("admin_session")
-    if not token:
-        return False
-    conn = get_db()
-    row = conn.execute("SELECT 1 FROM admin_sessions WHERE token=?", (token,)).fetchone()
-    conn.close()
-    return bool(row)
+    if token and token in admin_sessions:
+        return True
+    return False
 
 
 @app.get("/admin", response_class=HTMLResponse)
@@ -835,10 +740,9 @@ async def admin_page(request: Request, lang: str = "en"):
         return base_html(content, lang)
 
     # list pending + recent
-    conn = get_db()
-    pending = [dict(r) for r in conn.execute("SELECT * FROM payments WHERE status='pending' ORDER BY created_at DESC").fetchall()]
-    completed = [dict(r) for r in conn.execute("SELECT * FROM payments WHERE status='completed' ORDER BY created_at DESC LIMIT 20").fetchall()]
-    conn.close()
+    pending = [p for p in pending_payments.values() if p.get("status") == "pending"]
+    completed = [p for p in pending_payments.values() if p.get("status") == "completed"]
+    completed = sorted(completed, key=lambda x: x.get("created_at", ""), reverse=True)[:20]
 
     rows = ""
     if not pending:
@@ -889,10 +793,7 @@ async def admin_page(request: Request, lang: str = "en"):
 async def admin_login(username: str = Form(...), password: str = Form(...), lang: str = Form("en")):
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
         token = create_token()
-        conn = get_db()
-        conn.execute("INSERT INTO admin_sessions (token, created_at) VALUES (?,?)", (token, datetime.utcnow().isoformat()))
-        conn.commit()
-        conn.close()
+        admin_sessions.add(token)
         resp = RedirectResponse(f"/admin?lang={lang}", status_code=302)
         resp.set_cookie("admin_session", token, httponly=True, max_age=60*60*12)
         return resp
@@ -907,11 +808,8 @@ async def admin_login(username: str = Form(...), password: str = Form(...), lang
 @app.get("/admin/logout")
 async def admin_logout(request: Request):
     token = request.cookies.get("admin_session")
-    if token:
-        conn = get_db()
-        conn.execute("DELETE FROM admin_sessions WHERE token=?", (token,))
-        conn.commit()
-        conn.close()
+    if token in admin_sessions:
+        admin_sessions.discard(token)
     resp = RedirectResponse("/admin", status_code=302)
     resp.delete_cookie("admin_session")
     return resp
@@ -922,23 +820,17 @@ async def admin_approve(request: Request, payment_id: str = Form(...), lang: str
     if not get_admin(request):
         return RedirectResponse("/admin", status_code=302)
 
-    conn = get_db()
-    payment = conn.execute("SELECT * FROM payments WHERE payment_id=?", (payment_id,)).fetchone()
+    payment = pending_payments.get(payment_id)
     if not payment:
-        conn.close()
         return RedirectResponse(f"/admin?lang={lang}", status_code=302)
 
     if payment["status"] == "pending":
-        conn.execute(
-            "UPDATE payments SET status=?, approved_at=?, approved_by=? WHERE payment_id=?",
-            ("completed", datetime.utcnow().isoformat(), "admin", payment_id)
-        )
-        conn.execute(
-            "UPDATE users SET credits = credits + ? WHERE username=?",
-            (payment["credits"], payment["username"])
-        )
-        conn.commit()
-    conn.close()
+        payment["status"] = "completed"
+        payment["approved_at"] = datetime.utcnow().isoformat()
+        payment["approved_by"] = "admin"
+        username = payment["username"]
+        if username in users_db:
+            users_db[username]["credits"] += payment["credits"]
 
     return RedirectResponse(f"/admin?lang={lang}", status_code=302)
 
@@ -948,15 +840,10 @@ async def admin_reject(request: Request, payment_id: str = Form(...), lang: str 
     if not get_admin(request):
         return RedirectResponse("/admin", status_code=302)
 
-    conn = get_db()
-    payment = conn.execute("SELECT * FROM payments WHERE payment_id=?", (payment_id,)).fetchone()
+    payment = pending_payments.get(payment_id)
     if payment and payment["status"] == "pending":
-        conn.execute(
-            "UPDATE payments SET status=?, rejected_at=? WHERE payment_id=?",
-            ("rejected", datetime.utcnow().isoformat(), payment_id)
-        )
-        conn.commit()
-    conn.close()
+        payment["status"] = "rejected"
+        payment["rejected_at"] = datetime.utcnow().isoformat()
 
     return RedirectResponse(f"/admin?lang={lang}", status_code=302)
 
@@ -970,7 +857,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     print(f"{APP_NAME} Obfuscator v{VERSION}")
+    print(f"Bank: {BANK_INFO['bank']} {BANK_INFO['account']} ({BANK_INFO['holder']})")
     print(f"Listening on port {port}")
     print(f"Admin: /admin  (user={ADMIN_USERNAME} / pass={ADMIN_PASSWORD})")
-    print(f"DB: PostgreSQL (DATABASE_URL set={bool(DATABASE_URL)})")
     uvicorn.run(app, host="0.0.0.0", port=port)
