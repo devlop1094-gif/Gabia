@@ -28,9 +28,17 @@ import string
 APP_NAME = "Euana"
 VERSION = "1.0.0"
 
-# Pricing: 3 credits = 1 obfuscation, ~1500 KRW for 3 credits
+# Hosts: shop vs protect (same app, different pages)
+SHOP_HOSTS = {"daonshop.cloud", "www.daonshop.cloud"}
+PROTECT_HOSTS = {"api.daonshop.cloud"}
+# Shared cookie domain so login works on both hosts
+COOKIE_DOMAIN = os.environ.get("COOKIE_DOMAIN", ".daonshop.cloud")
+SHOP_URL = os.environ.get("SHOP_URL", "https://daonshop.cloud")
+PROTECT_URL = os.environ.get("PROTECT_URL", "https://api.daonshop.cloud")
+
+# Pricing: $2 = 3 credits (1 obfuscation costs 3 credits)
 CREDITS_PER_OBFUSCATION = 3
-KRW_PER_3_CREDITS = 1500
+USD_PER_3_CREDITS = 2.0
 
 CRYPTO_INFO = {
     "network": "LTC",
@@ -582,58 +590,136 @@ def calc_cost(intensity: str, options: List[str] = None) -> int:
 app = FastAPI(title=APP_NAME, version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-def base_html(content: str, lang: str = "en", user=None):
+
+def request_host(request: Request) -> str:
+    host = (request.headers.get("host") or "").split(":")[0].lower().strip()
+    return host
+
+def get_site(request: Request) -> str:
+    """Return 'shop' or 'protect' based on Host header."""
+    host = request_host(request)
+    if host in PROTECT_HOSTS or host.startswith("api."):
+        return "protect"
+    return "shop"
+
+def site_title(site: str) -> str:
+    if site == "protect":
+        return f"{APP_NAME} Protect"
+    return "DaonShop"
+
+def set_session_cookie(resp, token: str):
+    kwargs = dict(httponly=True, max_age=60*60*24*30, samesite="lax")
+    # Only set Domain on real daonshop hosts (not localhost)
+    if COOKIE_DOMAIN and "daonshop" in (COOKIE_DOMAIN or ""):
+        kwargs["domain"] = COOKIE_DOMAIN
+        kwargs["secure"] = True
+    resp.set_cookie("session", token, **kwargs)
+    return resp
+
+def base_html(content: str, lang: str = "en", user=None, site: str = "shop"):
     balance = user["credits"] if user else 0
     username = user["username"] if user else ""
-    nav_user = ""
-    if user:
-        nav_user = f"""
-        <span class="muted" style="margin-left:16px">{username} · {balance} credits</span>
-        <a href="/logout" class="btn btn-outline" style="margin-left:12px">{t('logout', lang)}</a>
+    title = site_title(site)
+    brand = "DaonShop" if site == "shop" else "Euana"
+    # sidebar nav
+    if site == "shop":
+        nav_items = f"""
+        <a class="nav-item" href="/dashboard"><span class="ico">▦</span> Dashboard</a>
+        <a class="nav-item" href="/dashboard#purchase"><span class="ico">🛒</span> Purchase</a>
+        <a class="nav-item" href="{PROTECT_URL}/dashboard"><span class="ico">◎</span> Obfuscation</a>
         """
+    else:
+        nav_items = f"""
+        <a class="nav-item" href="/dashboard"><span class="ico">◎</span> Obfuscation</a>
+        <a class="nav-item" href="{SHOP_URL}/dashboard"><span class="ico">🛒</span> Purchase</a>
+        <a class="nav-item" href="/dashboard"><span class="ico">▦</span> Dashboard</a>
+        """
+    user_block = ""
+    if user:
+        user_block = f"""
+        <a class="nav-item" href="#"><span class="ico">☺</span> {username}</a>
+        <div class="credits-pill">{balance} credits</div>
+        <a class="nav-item logout" href="/logout"><span class="ico">→</span> Logout</a>
+        """
+    else:
+        user_block = f"""
+        <a class="nav-item" href="/login"><span class="ico">☺</span> Login</a>
+        <a class="nav-item" href="/register"><span class="ico">+</span> Sign Up</a>
+        """
+
     return f"""<!DOCTYPE html>
 <html lang="{lang}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{APP_NAME}</title>
+<title>{title}</title>
 <style>
+:root {{
+  --bg:#f4f2fb;
+  --card:#ffffff;
+  --purple:#7c3aed;
+  --purple2:#8b5cf6;
+  --purple-soft:#ede9fe;
+  --text:#1e1b4b;
+  --muted:#6b7280;
+  --border:#e9e5f5;
+  --shadow:0 8px 24px rgba(124,58,237,.08);
+}}
 *{{box-sizing:border-box;margin:0;padding:0}}
-body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}}
-.container{{max-width:980px;margin:0 auto;padding:24px}}
-header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px;flex-wrap:wrap;gap:12px}}
-h1{{font-size:1.55rem;color:#a5b4fc}}
-.card{{background:#1e293b;border-radius:12px;padding:22px;margin-bottom:18px;border:1px solid #334155}}
-input,select,textarea{{width:100%;padding:11px;margin:7px 0 14px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;font-size:14px}}
-textarea{{height:210px;font-family:monospace;resize:vertical}}
-button,.btn{{display:inline-block;padding:11px 18px;border-radius:8px;border:none;background:#6366f1;color:white;font-weight:600;cursor:pointer;text-decoration:none;font-size:14px}}
-button:hover,.btn:hover{{background:#4f46e5}}
-.btn-outline{{background:transparent;border:1px solid #6366f1}}
+body{{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}}
+.layout{{display:flex;min-height:100vh}}
+.sidebar{{width:240px;background:var(--card);border-right:1px solid var(--border);padding:20px 14px;position:sticky;top:0;height:100vh}}
+.brand{{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.25rem;color:var(--purple);padding:8px 10px 22px}}
+.brand .logo{{width:32px;height:32px;border-radius:50%;border:2px dashed var(--purple);display:flex;align-items:center;justify-content:center;font-size:14px}}
+.nav-item{{display:flex;align-items:center;gap:10px;padding:12px 14px;border-radius:12px;color:var(--text);text-decoration:none;font-weight:600;font-size:14px;margin-bottom:4px}}
+.nav-item:hover,.nav-item.active{{background:var(--purple-soft);color:var(--purple)}}
+.nav-item.logout{{color:#dc2626}}
+.nav-item .ico{{width:20px;text-align:center;opacity:.85}}
+.credits-pill{{margin:12px 10px;background:var(--purple-soft);color:var(--purple);font-weight:700;font-size:13px;padding:8px 12px;border-radius:999px;text-align:center}}
+.main{{flex:1;padding:28px 28px 48px;max-width:960px}}
+h1,h2,h3{{color:var(--text)}}
+h2{{font-size:1.4rem;margin-bottom:8px}}
+h3{{font-size:1.1rem;margin-bottom:10px}}
+.muted{{color:var(--muted);font-size:13px}}
+.card{{background:var(--card);border-radius:18px;padding:22px;margin-bottom:18px;border:1px solid var(--border);box-shadow:var(--shadow)}}
+.plan{{background:var(--purple-soft);border-radius:16px;padding:18px;margin-bottom:12px;display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:12px}}
+.plan .name{{font-weight:700;font-size:1.05rem}}
+.plan .price{{font-weight:700;color:var(--purple);font-size:1.05rem}}
+.plan .actions{{display:flex;gap:8px;flex-wrap:wrap}}
+input,select,textarea{{width:100%;padding:12px 14px;margin:8px 0 14px;border-radius:12px;border:1px solid var(--border);background:#faf9fc;color:var(--text);font-size:14px}}
+textarea{{height:200px;font-family:ui-monospace,monospace;resize:vertical}}
+button,.btn{{display:inline-block;padding:11px 18px;border-radius:12px;border:none;background:var(--purple);color:#fff;font-weight:700;cursor:pointer;text-decoration:none;font-size:13px;letter-spacing:.02em}}
+button:hover,.btn:hover{{background:var(--purple2)}}
+.btn-outline{{background:#fff;color:var(--purple);border:1.5px solid var(--purple)}}
+.btn-soft{{background:var(--purple-soft);color:var(--purple)}}
 .row{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
-.muted{{color:#94a3b8;font-size:13px}}
-pre.result{{background:#020617;padding:16px;border-radius:8px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-size:12.5px;border:1px solid #1e293b;max-height:430px;overflow-y:auto}}
-.success{{color:#4ade80}}
-.error{{color:#f87171}}
-label{{font-size:13px;color:#94a3b8}}
-.nav a{{margin-left:12px;color:#a5b4fc;text-decoration:none;font-size:14px}}
-.opts{{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;margin:10px 0 16px}}
-.opts label{{display:flex;align-items:center;gap:8px;color:#e2e8f0;font-size:13px;cursor:pointer}}
-.opts input{{width:auto;margin:0}}
-@media(max-width:600px){{.opts{{grid-template-columns:1fr}}}}
+pre.result{{background:#0f172a;color:#e2e8f0;padding:16px;border-radius:12px;overflow:auto;white-space:pre-wrap;word-break:break-all;font-size:12px;max-height:420px}}
+.success{{color:#059669}}
+.error{{color:#dc2626}}
+label{{font-size:13px;color:var(--muted);font-weight:600}}
+.topbar{{display:none}}
+@media(max-width:800px){{
+  .layout{{flex-direction:column}}
+  .sidebar{{width:100%;height:auto;position:relative;border-right:none;border-bottom:1px solid var(--border)}}
+  .main{{padding:18px}}
+}}
 </style>
 </head>
 <body>
-<div class="container">
-<header>
-  <h1>{APP_NAME}</h1>
-  <div class="nav">
-    {nav_user}
-  </div>
-</header>
-{content}
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand"><div class="logo">🔒</div>{brand}</div>
+    {nav_items}
+    {user_block}
+  </aside>
+  <main class="main">
+    {content}
+  </main>
 </div>
 </body>
 </html>"""
+
+
 
 # ======================
 # Routes
@@ -672,22 +758,37 @@ async def db_check():
 
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request, lang: str = "en"):
+    site = get_site(request)
     user = get_current_user(request)
     if user:
         return RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
-    content = f"""
-    <div class="card">
-        <h2>{t('welcome', lang)}</h2>
-        <p class="muted" style="margin:12px 0 24px">Luau / Lua Obfuscator + Credit System</p>
-        <div class="row">
-            <a class="btn" href="/register?lang={lang}">{t('register', lang)}</a>
-            <a class="btn btn-outline" href="/login?lang={lang}">{t('login', lang)}</a>
-        </div>
-    </div>"""
-    return base_html(content, lang)
+    if site == "protect":
+        content = f"""
+        <div class="card">
+            <h2>Euana Protect</h2>
+            <p class="muted" style="margin:12px 0 24px">Luau / Lua obfuscation dashboard. Buy credits on the shop, then protect your scripts here.</p>
+            <div class="row">
+                <a class="btn" href="/login?lang={lang}">{t('login', lang)}</a>
+                <a class="btn btn-outline" href="/register?lang={lang}">{t('register', lang)}</a>
+                <a class="btn btn-outline" href="{SHOP_URL}">Buy credits (Shop)</a>
+            </div>
+        </div>"""
+    else:
+        content = f"""
+        <div class="card">
+            <h2>DaonShop</h2>
+            <p class="muted" style="margin:12px 0 24px">Credit shop for Euana Protect. $2 = 3 credits. Pay with Litecoin, then obfuscate on Protect.</p>
+            <div class="row">
+                <a class="btn" href="/login?lang={lang}">{t('login', lang)}</a>
+                <a class="btn btn-outline" href="/register?lang={lang}">{t('register', lang)}</a>
+                <a class="btn btn-outline" href="{PROTECT_URL}">Open Protect</a>
+            </div>
+        </div>"""
+    return base_html(content, lang, site=site)
 
 @app.get("/register", response_class=HTMLResponse)
-async def register_page(lang: str = "en"):
+async def register_page(request: Request, lang: str = "en"):
+    site = get_site(request)
     content = f"""
     <div class="card">
         <h2>{t('register', lang)}</h2>
@@ -701,7 +802,7 @@ async def register_page(lang: str = "en"):
         </form>
         <p class="muted" style="margin-top:16px"><a href="/login?lang={lang}" style="color:#a5b4fc">{t('login', lang)}</a></p>
     </div>"""
-    return base_html(content, lang)
+    return base_html(content, lang, site=site)
 
 @app.post("/register")
 async def register(username: str = Form(...), password: str = Form(...), lang: str = Form("en")):
@@ -728,11 +829,12 @@ async def register(username: str = Form(...), password: str = Form(...), lang: s
         <a class="btn" href="/register?lang={lang}">{t('register', lang)}</a></div>"""
         return HTMLResponse(base_html(content, lang))
     resp = RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
-    resp.set_cookie("session", token, httponly=True, max_age=60*60*24*30)
+    set_session_cookie(resp, token)
     return resp
 
 @app.get("/login", response_class=HTMLResponse)
-async def login_page(lang: str = "en"):
+async def login_page(request: Request, lang: str = "en"):
+    site = get_site(request)
     content = f"""
     <div class="card">
         <h2>{t('login', lang)}</h2>
@@ -746,7 +848,7 @@ async def login_page(lang: str = "en"):
         </form>
         <p class="muted" style="margin-top:16px"><a href="/register?lang={lang}" style="color:#a5b4fc">{t('register', lang)}</a></p>
     </div>"""
-    return base_html(content, lang)
+    return base_html(content, lang, site=site)
 
 @app.post("/login")
 async def login(username: str = Form(...), password: str = Form(...), lang: str = Form("en")):
@@ -768,7 +870,7 @@ async def login(username: str = Form(...), password: str = Form(...), lang: str 
         <a class="btn" href="/login?lang={lang}">{t('login', lang)}</a></div>"""
         return HTMLResponse(base_html(content, lang))
     resp = RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
-    resp.set_cookie("session", token, httponly=True, max_age=60*60*24*30)
+    set_session_cookie(resp, token)
     return resp
 
 @app.get("/logout")
@@ -785,6 +887,7 @@ async def logout(request: Request):
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, lang: str = "en", result_id: str = None, error: str = None):
+    site = get_site(request)
     user = get_current_user(request)
     if not user:
         return RedirectResponse(f"/login?lang={lang}", status_code=302)
@@ -805,15 +908,19 @@ async def dashboard(request: Request, lang: str = "en", result_id: str = None, e
             </div>
         </div>"""
 
-    content = f"""
+    balance_card = f"""
     <div class="card">
-        <h2>{t('dashboard', lang)}</h2>
+        <h2>{"Protect Dashboard" if site == "protect" else "Shop Dashboard"}</h2>
         <p style="font-size:1.25rem;margin:10px 0">{t('balance', lang)}: <strong>{user['credits']}</strong></p>
     </div>
-    {result_block}
-        <div class="card">
+    """
+
+    if site == "protect":
+        content = balance_card + result_block + f"""
+    <div class="card">
         <h3>Obfuscate</h3>
-        <p class="muted">3 credits = 1 run (~1500 KRW per 3 credits). Paste code or upload a .lua / .txt file.</p>
+        <p class="muted">3 credits = 1 run. Paste code or upload a .lua / .txt file. Buy credits at the shop if needed.</p>
+        <p class="muted" style="margin-bottom:12px"><a href="{SHOP_URL}/dashboard" style="color:#a5b4fc">→ Buy credits on DaonShop</a></p>
         <form method="post" action="/obfuscate" enctype="multipart/form-data">
             <input type="hidden" name="lang" value="{lang}">
             <label>Version</label>
@@ -828,19 +935,83 @@ async def dashboard(request: Request, lang: str = "en", result_id: str = None, e
             <button type="submit">Obfuscate (3 credits)</button>
         </form>
     </div>
+"""
+    else:
+        content = balance_card + f"""
+    <div class="card" id="purchase">
+        <h2>Purchase Plans</h2>
+        <p class="muted" style="margin-bottom:16px">$2 = 3 credits · 3 credits = 1 obfuscation · Pay with Litecoin</p>
+
+        <div class="plan">
+            <div>
+                <div class="name">☺ Starter Pack</div>
+                <div class="muted">3 credits · 1 obfuscation</div>
+            </div>
+            <div class="price">$2</div>
+            <div class="actions">
+                <form method="post" action="/charge" style="display:inline">
+                    <input type="hidden" name="lang" value="{lang}">
+                    <input type="hidden" name="method" value="crypto">
+                    <input type="hidden" name="credits_buy" value="3">
+                    <button type="submit">BUY NOW</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="plan">
+            <div>
+                <div class="name">★ Basic</div>
+                <div class="muted">15 credits · 5 obfuscations</div>
+            </div>
+            <div class="price">$10</div>
+            <div class="actions">
+                <form method="post" action="/charge" style="display:inline">
+                    <input type="hidden" name="lang" value="{lang}">
+                    <input type="hidden" name="method" value="crypto">
+                    <input type="hidden" name="credits_buy" value="15">
+                    <button type="submit">BUY NOW</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="plan">
+            <div>
+                <div class="name">🏆 Premium</div>
+                <div class="muted">45 credits · 15 obfuscations</div>
+            </div>
+            <div class="price">$30</div>
+            <div class="actions">
+                <form method="post" action="/charge" style="display:inline">
+                    <input type="hidden" name="lang" value="{lang}">
+                    <input type="hidden" name="method" value="crypto">
+                    <input type="hidden" name="credits_buy" value="45">
+                    <button type="submit">BUY NOW</button>
+                </form>
+            </div>
+        </div>
+
+        <div class="plan">
+            <div>
+                <div class="name">📦 Custom amount</div>
+                <div class="muted">Multiples of 3 credits · $2 per 3 credits</div>
+            </div>
+            <form method="post" action="/charge" class="actions" style="align-items:center">
+                <input type="hidden" name="lang" value="{lang}">
+                <input type="hidden" name="method" value="crypto">
+                <input type="number" name="credits_buy" value="3" min="3" step="3" style="width:120px;margin:0">
+                <button type="submit">BUY NOW</button>
+            </form>
+        </div>
+    </div>
     <div class="card">
-        <h3>Buy credits (Litecoin only)</h3>
-        <p class="muted">Pay with LTC only. 3 credits ≈ 1500 KRW. Submit txid after payment for admin approval.</p>
-        <form method="post" action="/charge">
-            <input type="hidden" name="lang" value="{lang}">
-            <input type="hidden" name="method" value="crypto">
-            <label>Credits (multiples of 3)</label>
-            <input type="number" name="credits_buy" value="3" min="3" step="3">
-            <button type="submit">Get LTC address</button>
-        </form>
+        <h3>Euana Protect</h3>
+        <p class="muted" style="margin-bottom:12px">Use credits on the protect dashboard to obfuscate Luau / Lua scripts.</p>
+        <a class="btn" href="{PROTECT_URL}/dashboard">Open Obfuscation</a>
     </div>
 """
-    return base_html(content, lang, user)
+    return base_html(content, lang, user, site=site)
+
+
 
 
 @app.post("/obfuscate")
@@ -889,7 +1060,7 @@ async def do_obfuscate(
     user["results"][result_id] = result
     save_user(user)
 
-    return RedirectResponse(f"/dashboard?lang={lang}&result_id={result_id}", status_code=302)
+    return RedirectResponse(f"{PROTECT_URL}/dashboard?lang={lang}&result_id={result_id}", status_code=302)
 
 
 @app.get("/download/{result_id}")
@@ -927,8 +1098,8 @@ async def create_charge(
         credits_buy = credits_buy + (3 - credits_buy % 3)
 
     payment_id = str(uuid.uuid4())[:8]
-    # Reference KRW value for display only
-    krw_value = (credits_buy / 3) * KRW_PER_3_CREDITS
+    # USD reference: $2 per 3 credits
+    usd_value = (credits_buy / 3) * USD_PER_3_CREDITS
     created = datetime.utcnow().isoformat()
 
     conn = get_db()
@@ -936,7 +1107,7 @@ async def create_charge(
         """INSERT INTO payments
            (payment_id, username, method, amount, credits, krw_value, status, created_at)
            VALUES (?,?,?,?,?,?,?,?)""",
-        (payment_id, user["username"], "ltc", credits_buy, credits_buy, krw_value, "pending", created)
+        (payment_id, user["username"], "ltc", credits_buy, credits_buy, usd_value, "pending", created)
     )
     conn.commit()
     conn.close()
@@ -946,7 +1117,7 @@ async def create_charge(
         <h3>Litecoin payment</h3>
         <p><strong>{CRYPTO_INFO['currency']}</strong> ({CRYPTO_INFO['network']})</p>
         <p style="font-size:1.1rem;word-break:break-all">{CRYPTO_INFO['address']}</p>
-        <p class="muted">Credits: <strong>{credits_buy}</strong> (ref. ~{krw_value:,.0f} KRW)</p>
+        <p class="muted">Credits: <strong>{credits_buy}</strong> · <strong>${usd_value:,.2f}</strong> USD</p>
         <p class="muted">Payment ID: <code>{payment_id}</code></p>
         <hr style="border-color:#334155;margin:20px 0">
         <p>After sending LTC, paste the transaction ID below. Admin will approve and grant credits.</p>
@@ -1067,11 +1238,57 @@ async def admin_page(request: Request, lang: str = "en"):
     for p in completed:
         done_rows += f"<p class='muted'>{p['payment_id']} · {p['username']} · {p['credits']}cr · {p.get('created_at','')}</p>"
 
+    result_id = request.query_params.get("result_id")
+    error = request.query_params.get("error")
+    result_block = ""
+    if error:
+        result_block = f"""<div class="card"><p class="error">{html_lib.escape(error)}</p></div>"""
+    elif result_id:
+        # admin results stored in memory-like table via payments? use a simple admin_results in users table under username __admin__
+        conn2 = get_db()
+        row = conn2.execute("SELECT results FROM users WHERE username=?", ("__admin__",)).fetchone()
+        conn2.close()
+        results = {}
+        if row:
+            try:
+                results = json.loads(row["results"] or "{}")
+            except Exception:
+                results = {}
+        if result_id in results:
+            safe = html_lib.escape(results[result_id])
+            result_block = f"""
+            <div class="card">
+                <h3 class="success">Admin obfuscation done (free)</h3>
+                <pre class="result" id="obfResult">{safe}</pre>
+                <div class="row" style="margin-top:12px">
+                    <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('obfResult').innerText)">Copy</button>
+                    <a class="btn" href="/admin/download/{result_id}" style="margin-left:8px">Download .lua</a>
+                </div>
+            </div>"""
+
     content = f"""
     <div class="card">
         <h2>Admin Dashboard</h2>
-        <p class="muted">Approve or reject pending payments</p>
+        <p class="muted">Payments + free obfuscation</p>
         <p><a href="/admin/logout" class="btn btn-outline">Admin Logout</a></p>
+    </div>
+    {result_block}
+    <div class="card">
+        <h3>Free Obfuscate (admin only)</h3>
+        <p class="muted">No credit cost. Unlimited.</p>
+        <form method="post" action="/admin/obfuscate" enctype="multipart/form-data">
+            <input type="hidden" name="lang" value="{lang}">
+            <label>Version</label>
+            <select name="intensity">
+                <option value="v1">Euana v1</option>
+                <option value="v2" selected>Euana v2</option>
+            </select>
+            <label>Code</label>
+            <textarea name="code" placeholder="Paste Luau / Lua code"></textarea>
+            <label>Or upload file</label>
+            <input type="file" name="file" accept=".lua,.luau,.txt,.text">
+            <button type="submit">Obfuscate (free)</button>
+        </form>
     </div>
     <div class="card">
         <h3>Pending ({len(pending)})</h3>
@@ -1114,6 +1331,88 @@ async def admin_logout(request: Request):
     resp = RedirectResponse("/admin", status_code=302)
     resp.delete_cookie("admin_session")
     return resp
+
+
+
+@app.post("/admin/obfuscate")
+async def admin_obfuscate(
+    request: Request,
+    code: str = Form(""),
+    intensity: str = Form("v2"),
+    lang: str = Form("en"),
+    file: UploadFile = File(None),
+):
+    if not get_admin(request):
+        return RedirectResponse("/admin", status_code=302)
+
+    if file and file.filename:
+        raw = await file.read()
+        try:
+            code = raw.decode("utf-8")
+        except Exception:
+            code = raw.decode("latin-1", errors="ignore")
+
+    code = (code or "").strip()
+    if len(code) < 5:
+        return RedirectResponse(f"/admin?lang={lang}&error=Paste+code+or+upload+file", status_code=302)
+
+    if intensity not in ("v1", "v2"):
+        intensity = "v2"
+
+    result = obfuscate_code(code, intensity, [])
+    result_id = str(uuid.uuid4())[:8]
+
+    # store under synthetic __admin__ user
+    conn = get_db()
+    row = conn.execute("SELECT results FROM users WHERE username=?", ("__admin__",)).fetchone()
+    if not row:
+        conn.execute(
+            "INSERT INTO users (username, password, credits, results, created_at) VALUES (?,?,?,?,?)",
+            ("__admin__", hash_password(secrets.token_hex(16)), 0, "{}", datetime.utcnow().isoformat()),
+        )
+        results = {}
+    else:
+        try:
+            results = json.loads(row["results"] or "{}")
+        except Exception:
+            results = {}
+    results[result_id] = result
+    # keep last 30 only
+    if len(results) > 30:
+        for k in list(results.keys())[:-30]:
+            del results[k]
+    conn.execute(
+        "UPDATE users SET results=? WHERE username=?",
+        (json.dumps(results), "__admin__"),
+    )
+    conn.commit()
+    conn.close()
+
+    return RedirectResponse(f"/admin?lang={lang}&result_id={result_id}", status_code=302)
+
+
+@app.get("/admin/download/{result_id}")
+async def admin_download(request: Request, result_id: str):
+    if not get_admin(request):
+        return RedirectResponse("/admin", status_code=302)
+    conn = get_db()
+    row = conn.execute("SELECT results FROM users WHERE username=?", ("__admin__",)).fetchone()
+    conn.close()
+    results = {}
+    if row:
+        try:
+            results = json.loads(row["results"] or "{}")
+        except Exception:
+            results = {}
+    content = results.get(result_id)
+    if not content:
+        return RedirectResponse("/admin?error=Result+not+found", status_code=302)
+    filename = f"admin_obfuscated_{result_id}.lua"
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.post("/admin/approve")
