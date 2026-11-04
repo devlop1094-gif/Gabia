@@ -321,39 +321,35 @@ def rand_name(length: int = 8) -> str:
 
 # ======================
 # Obfuscation Engine (AntiLua-style VM)
-# - setmetatable dispatch table
+# - setmetatable dispatch
 # - mixed hex/binary literals
-# - control-flow state machine
-# - multi-layer packing (no plain XOR string)
-# - no recoverable source in output
+# - CF state machine
+# - returns loaded chunk result (fixes nil/null)
 # ======================
 
 def _rand_ident(n: int = 8) -> str:
-    # mix letter styles like commercial obfuscators
     if random.random() < 0.35:
         return "".join(random.choices(string.ascii_letters, k=n))
     return "_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 
 def _num(n: int, mask32: bool = False) -> str:
-    """Emit integer in random base style (dec / hex / bin)."""
     n = int(n)
     if mask32:
         n = n & 0xFFFFFFFF
     if n < 0:
         n = n & 0xFFFFFFFF
     r = random.random()
-    if 0 <= n < 16 and r < 0.35:
+    if 0 <= n < 16 and r < 0.3:
         return str(n)
     if r < 0.4:
         return hex(n)
-    if r < 0.75 and n < (1 << 64):
+    if r < 0.7 and 0 <= n < (1 << 48):
         return "0b" + format(n, "b")
     return "0x" + format(n, "X")
 
 
 def _pack_bytes(data: bytes, seed: int) -> list:
-    """Pack bytes -> list of 32-bit ints with LCG keystream + position mix."""
     out = []
     state = seed & 0xFFFFFFFF
     i = 0
@@ -382,15 +378,10 @@ def _opaque_true() -> str:
     a = random.randint(2, 17)
     forms = [
         f"(function()local a={_num(a)}return a*a>={_num(0)}end)()",
-        f"(function()local a={_num(a)}return(a+a)==(a*2)end)()",
-        f"(function()local a={_num(a)}return not(a*a<0)end)()",
+        f"(function()local a={_num(a)}return(a+a)==(a*{_num(2)})end)()",
+        f"(function()local a={_num(a)}return not(a*a<{_num(0)})end)()",
     ]
     return random.choice(forms)
-
-
-def _opaque_false() -> str:
-    a = random.randint(2, 17)
-    return f"(function()local a={_num(a)}return a*a<{_num(0)}end)()"
 
 
 def _junk_block() -> str:
@@ -404,18 +395,18 @@ def _junk_block() -> str:
 
 def _emit_vm(src: str, intensity: str) -> str:
     """
-    AntiLua-inspired wrapper:
-    return setmetatable({ [handlers] }, { }):ENTRY()
-    Handlers decode packed bytecode via state-machine CF, rebuild source, load+run.
+    Emit:
+      return setmetatable({...}, {__index=...}):ENTRY()
+    The loaded original chunk's return values are propagated (no silent nil).
     """
     raw = src.encode("utf-8")
     seed = random.randint(0x10000, 0x7FFFFFFF)
     packed = _pack_bytes(raw, seed)
     chunks = _split_table(packed)
 
-    # names
-    id_env = _rand_ident(3)
-    id_entry = _rand_ident(2)  # method name on metatable
+    id_bxor = _rand_ident(4)
+    id_dec = _rand_ident(4)
+    id_main = _rand_ident(4)
     id_bc = _rand_ident(4)
     id_buf = _rand_ident(4)
     id_key = _rand_ident(3)
@@ -428,38 +419,24 @@ def _emit_vm(src: str, intensity: str) -> str:
     id_run = _rand_ident(4)
     id_fn = _rand_ident(3)
     id_err = _rand_ident(3)
-    id_st = _rand_ident(3)  # state for CF flatten
-    id_acc = _rand_ident(3)
-    id_bxor = _rand_ident(4)
-    id_dec = _rand_ident(4)
-    id_main = _rand_ident(4)
+    id_st = _rand_ident(3)
+    id_ret = _rand_ident(3)
+    id_loader = _rand_ident(4)
 
-    # bytecode nested tables
     bc_parts = ",".join(_emit_number_table(c) for c in chunks)
 
-    # state-machine states
-    S_INIT, S_DECODE, S_BUILD, S_LOAD, S_RUN, S_DONE = 1, 2, 3, 4, 5, 6
-    # shuffle display values
-    states = [S_INIT, S_DECODE, S_BUILD, S_LOAD, S_RUN, S_DONE]
-    random.shuffle(states)
-    # map logical -> actual
-    # keep sequential for correctness but express as opaque nums
-    st_init = _num(1)
-    st_decode = _num(2)
-    st_build = _num(3)
-    st_load = _num(4)
-    st_run = _num(5)
-    st_done = _num(6)
-
+    st_init, st_decode, st_build, st_load, st_run, st_done = (
+        _num(1), _num(2), _num(3), _num(4), _num(5), _num(6)
+    )
     junk1 = _junk_block()
     junk2 = _junk_block()
     ot = _opaque_true()
 
-    # portable 3-way XOR for bytes (no bit32 required)
+    # Portable byte XOR (x^y^z) without bit32
     bxor_fn = f"""local function {id_bxor}(x,y,z)
-x=x%{_num(256)};y=y%{_num(256)};z=z%{_num(256)}
+x=math.floor(x)%{_num(256)};y=math.floor(y)%{_num(256)};z=math.floor(z)%{_num(256)}
 local r,p={_num(0)},{_num(1)}
-for _=1,8 do
+for _=1,{_num(8)} do
 local bx,by,bz=x%{_num(2)},y%{_num(2)},z%{_num(2)}
 r=r+((bx+by+bz)%{_num(2)})*p
 x=math.floor(x/{_num(2)});y=math.floor(y/{_num(2)});z=math.floor(z/{_num(2)});p=p*{_num(2)}
@@ -467,9 +444,9 @@ end
 return r
 end"""
 
-    # decoder for one u32 word into up to 4 bytes
     dec_fn = f"""local function {id_dec}(word,key,pos,out,olen)
 key=(key*{_num(1664525)}+{_num(1013904223)})%{_num(4294967296)}
+word=math.floor(word)
 for a=0,3 do
 if pos<olen then
 local div={_num(1)}
@@ -483,15 +460,16 @@ end
 return key,pos
 end"""
 
-    # main body with CF flattening
-    main_fn = f"""local function {id_main}()
+    # CRITICAL: return the chunk's return value(s)
+    main_fn = f"""local function {id_main}(...)
 local {id_bc}={{{bc_parts}}}
 local {id_buf}={{}}
 local {id_key}={_num(seed)}
 local {id_len}={_num(len(raw))}
 local {id_j}={_num(0)}
 local {id_st}={st_init}
-local {id_run},{id_fn},{id_err}
+local {id_run},{id_fn},{id_err},{id_ret}
+local {id_loader}=load or loadstring
 {junk1}
 while {id_st}~={st_done} do
 if {id_st}=={st_init} then
@@ -513,41 +491,40 @@ end
 end
 {id_st}={st_build}
 elseif {id_st}=={st_build} then
-{id_run}=""
-for {id_i}=1,{id_len} do
-{id_run}={id_run}..string.char({id_buf}[{id_i}])
-end
+local t={{}}
+for {id_i}=1,{id_len} do t[{id_i}]=string.char({id_buf}[{id_i}]) end
+{id_run}=table.concat(t)
 {id_st}={st_load}
 elseif {id_st}=={st_load} then
-{id_fn},{id_err}=(load or loadstring)({id_run})
-if not {id_fn} then error({id_err} or "load") end
+{id_fn},{id_err}={id_loader}({id_run})
+if not {id_fn} then error({id_err} or "load failed") end
 {id_st}={st_run}
 elseif {id_st}=={st_run} then
-if {ot} then {id_fn}() end
+if {ot} then
+{id_ret}={id_fn}(...)
+else
+{id_ret}={id_fn}(...)
+end
 {id_st}={st_done}
 else
 {id_st}={st_done}
 end
 end
+return {id_ret}
 end"""
 
-    # setmetatable dispatch style (AntiLua-like surface)
-    # handlers table with numeric keys in hex/bin
     k_main = random.randint(0x40, 0xFF)
     k_boot = random.randint(0x100, 0x3FF)
-
     handler_main = _num(k_main)
     handler_boot = _num(k_boot)
-
-    # entry method name random short
     entry = random.choice(["B", "R", "X", "K", "Z", "Q"])
 
     vm = f"""return setmetatable({{
-[{handler_main}]=function({id_env})
+[{handler_main}]=function(self,...)
 {bxor_fn}
 {dec_fn}
 {main_fn}
-return {id_main}()
+return {id_main}(...)
 end,
 [{handler_boot}]=function(self,...)
 return self[{handler_main}](self,...)
@@ -558,15 +535,10 @@ if k=="{entry}" then return t[{handler_boot}] end
 end
 }}):{entry}(...)"""
 
-    # single line minify for v2 outer; keep slightly readable structure for debug of engine
     if intensity == "v2":
-        # compress whitespace
         vm = " ".join(vm.split())
-        # but restore some newlines after certain keywords for Luau parser safety - actually one line is fine in Lua
     else:
-        lines = [ln.rstrip() for ln in vm.splitlines() if ln.strip()]
-        vm = "\n".join(lines)
-
+        vm = "\n".join(ln.rstrip() for ln in vm.splitlines() if ln.strip())
     return vm
 
 
@@ -588,8 +560,6 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     if not src.strip():
         src = code
 
-    # v1: single VM layer (AntiLua-style surface)
-    # v2: double layer + heavier junk / minified
     body = _emit_vm(src, intensity)
     if intensity == "v2":
         body = _emit_vm(body, "v2")
@@ -919,7 +889,8 @@ async def do_obfuscate(
     user["results"][result_id] = result
     save_user(user)
 
-    
+    return RedirectResponse(f"/dashboard?lang={lang}&result_id={result_id}", status_code=302)
+
 
 @app.get("/download/{result_id}")
 async def download_result(request: Request, result_id: str):
