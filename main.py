@@ -1,4 +1,15 @@
-from fastapi import FastAPI, Request, Form
+"""
+Euana - Single File (Render Ready)
+- 회원가입 / 로그인
+- 한국인 → KakaoBank 계좌이체
+- 외국인 → 코인 (추후 주소)
+- 크레딧 시스템
+- 서버 난독화 + 대시보드 결과 표시
+- 한/영 토글
+- 다양한 난독화 옵션
+"""
+
+from fastapi import FastAPI, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
@@ -16,24 +27,17 @@ import string
 # Config
 # ======================
 
-APP_NAME = "VeilObfuscator"
-VERSION = "0.3.0"
+APP_NAME = "Euana"
+VERSION = "1.0.0"
 
-CREDIT_RATES = {
-    "KRW": 100,
-    "USDT": 0.01,
-}
-
-BANK_INFO = {
-    "bank": "카카오뱅크",
-    "account": "7777-03-0806539",
-    "holder": "김시우",
-}
+# Pricing: 3 credits = 1 obfuscation, ~1500 KRW for 3 credits
+CREDITS_PER_OBFUSCATION = 3
+KRW_PER_3_CREDITS = 1500
 
 CRYPTO_INFO = {
-    "network": "TRC20",
-    "currency": "USDT",
-    "address": "COMING_SOON",
+    "network": "LTC",
+    "currency": "LTC",
+    "address": "ltc1qtu5cwhmqjjdnkjk5p8ar2quyke6g7xr2re0qpk",  # set your Litecoin address
 }
 
 # Admin
@@ -41,24 +45,14 @@ ADMIN_USERNAME = "admin"
 ADMIN_PASSWORD = "admin1234"  # 배포 전 꼭 변경
 admin_sessions = set()
 
+# v1 / v2 both cost 3 credits; v2 uses stronger pipeline
 BASE_COST = {
-    "basic": 5,
-    "strong": 12,
-    "extreme": 25,
+    "v1": 3,
+    "v2": 3,
 }
 
-OPTION_COST = {
-    "rename_vars": 3,
-    "encrypt_strings": 5,
-    "cff": 8,
-    "dead_code": 4,
-    "junk_code": 3,
-    "anti_tamper": 6,
-    "minify": 2,
-    "opaque_predicates": 5,
-    "proxy_functions": 4,
-    "number_encrypt": 3,
-}
+OPTION_COST = {}  # options baked into v1/v2
+
 
 users_db = {}
 sessions = {}
@@ -70,8 +64,8 @@ pending_payments = {}
 
 LANG = {
     "ko": {
-        "app_name": "VeilObfuscator",
-        "welcome": "VeilObfuscator에 오신 것을 환영합니다",
+        "app_name": "Euana",
+        "welcome": "Euana에 오신 것을 환영합니다",
         "register": "회원가입",
         "login": "로그인",
         "logout": "로그아웃",
@@ -83,8 +77,8 @@ LANG = {
         "bank_transfer": "계좌이체",
         "crypto": "코인 결제",
         "select_amount": "충전 금액",
-        "after_transfer": "입금 후 입금자명 또는 TxHash를 입력하고 확인을 눌러주세요",
-        "depositor_name": "입금자명",
+        "after_transfer": "입금 후 Depositor name 또는 TxHash를 입력하고 확인을 눌러주세요",
+        "depositor_name": "Depositor name",
         "tx_hash": "트랜잭션 해시 (TxID)",
         "confirm_payment": "결제 확인 요청",
         "insufficient_credit": "크레딧이 부족합니다. 충전이 필요합니다.",
@@ -114,8 +108,8 @@ LANG = {
         "opt_numbers": "숫자 암호화",
     },
     "en": {
-        "app_name": "VeilObfuscator",
-        "welcome": "Welcome to VeilObfuscator",
+        "app_name": "Euana",
+        "welcome": "Welcome to Euana",
         "register": "Sign Up",
         "login": "Login",
         "logout": "Logout",
@@ -159,8 +153,9 @@ LANG = {
     }
 }
 
-def t(key: str, lang: str = "ko") -> str:
-    return LANG.get(lang, LANG["ko"]).get(key, key)
+def t(key: str, lang: str = "en") -> str:
+    # English only
+    return LANG.get("en", {}).get(key, key)
 
 # ======================
 # Helpers
@@ -178,10 +173,9 @@ def get_current_user(request: Request):
         return None
     return users_db.get(sessions[token])
 
-def calc_credits(amount: float, method: str) -> int:
-    if method == "bank":
-        return max(1, int(amount / CREDIT_RATES["KRW"]))
-    return max(1, int(amount / CREDIT_RATES["USDT"]))
+def calc_credits(amount: float, method: str = "ltc") -> int:
+    # amount is credits to buy
+    return max(3, int(amount))
 
 def rand_name(length: int = 8) -> str:
     return "_" + "".join(random.choices(string.ascii_letters, k=length))
@@ -267,16 +261,19 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     result = code
     opts = set(options or [])
     header = [
-        f"-- Obfuscated by {APP_NAME} v{VERSION}",
-        f"-- intensity: {intensity} | options: {', '.join(sorted(opts)) if opts else 'none'}",
+        f"-- This file was obfuscated by Euana.",
+        f"-- https://daonshop.cloud",
+        f"-- version: {intensity} | {APP_NAME} {VERSION}",
         f"-- {datetime.utcnow().isoformat()}Z",
         "",
     ]
 
-    if intensity == "strong":
-        opts.update(["rename_vars", "encrypt_strings", "junk_code"])
-    elif intensity == "extreme":
-        opts.update(["rename_vars", "encrypt_strings", "cff", "dead_code", "junk_code", "number_encrypt", "opaque_predicates"])
+    # v1 = standard, v2 = upgraded pipeline
+    if intensity == "v1":
+        opts.update(["rename_vars", "encrypt_strings", "junk_code", "minify"])
+    else:  # v2
+        opts.update(["rename_vars", "encrypt_strings", "cff", "dead_code", "junk_code", "number_encrypt", "opaque_predicates", "anti_tamper", "proxy_functions"])
+        intensity = "v2"
 
     if "minify" in opts:
         lines = []
@@ -340,7 +337,7 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     if "cff" in opts:
         result = "local _st=0" + chr(10) + "while true do" + chr(10) + "if _st==0 then" + chr(10) + result + chr(10) + "_st=1" + chr(10) + "elseif _st==1 then break end" + chr(10) + "end"
 
-    if intensity == "extreme" and ("cff" in opts or "encrypt_strings" in opts):
+    if intensity == "v2":
         key = random.randint(0x30, 0x6F)
         payload = _xor_string(result, key)
         result = (
@@ -353,11 +350,8 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     return chr(10).join(header) + result
 
 
-def calc_cost(intensity: str, options: List[str]) -> int:
-    cost = BASE_COST.get(intensity, 12)
-    for opt in options:
-        cost += OPTION_COST.get(opt, 0)
-    return cost
+def calc_cost(intensity: str, options: List[str] = None) -> int:
+    return BASE_COST.get(intensity, CREDITS_PER_OBFUSCATION)
 
 # ======================
 # App
@@ -366,7 +360,7 @@ def calc_cost(intensity: str, options: List[str]) -> int:
 app = FastAPI(title=APP_NAME, version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-def base_html(content: str, lang: str = "ko", user=None):
+def base_html(content: str, lang: str = "en", user=None):
     balance = user["credits"] if user else 0
     username = user["username"] if user else ""
     nav_user = ""
@@ -411,7 +405,7 @@ label{{font-size:13px;color:#94a3b8}}
 <header>
   <h1>{APP_NAME}</h1>
   <div class="nav">
-    <a href="/?lang=ko">한국어</a>
+    <a href="/?lang=en">한국어</a>
     <a href="/?lang=en">English</a>
     {nav_user}
   </div>
@@ -426,7 +420,7 @@ label{{font-size:13px;color:#94a3b8}}
 # ======================
 
 @app.get("/", response_class=HTMLResponse)
-async def home(request: Request, lang: str = "ko"):
+async def home(request: Request, lang: str = "en"):
     user = get_current_user(request)
     if user:
         return RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
@@ -442,7 +436,7 @@ async def home(request: Request, lang: str = "ko"):
     return base_html(content, lang)
 
 @app.get("/register", response_class=HTMLResponse)
-async def register_page(lang: str = "ko"):
+async def register_page(lang: str = "en"):
     content = f"""
     <div class="card">
         <h2>{t('register', lang)}</h2>
@@ -459,7 +453,7 @@ async def register_page(lang: str = "ko"):
     return base_html(content, lang)
 
 @app.post("/register")
-async def register(username: str = Form(...), password: str = Form(...), lang: str = Form("ko")):
+async def register(username: str = Form(...), password: str = Form(...), lang: str = Form("en")):
     username = username.strip().lower()
     if username in users_db:
         content = f"""<div class="card"><p class="error">{t('already_exists', lang)}</p>
@@ -468,7 +462,7 @@ async def register(username: str = Form(...), password: str = Form(...), lang: s
     users_db[username] = {
         "username": username,
         "password": hash_password(password),
-        "credits": 40,
+        "credits": 3,
         "lang": lang,
         "results": {},
         "created_at": datetime.utcnow().isoformat(),
@@ -480,7 +474,7 @@ async def register(username: str = Form(...), password: str = Form(...), lang: s
     return resp
 
 @app.get("/login", response_class=HTMLResponse)
-async def login_page(lang: str = "ko"):
+async def login_page(lang: str = "en"):
     content = f"""
     <div class="card">
         <h2>{t('login', lang)}</h2>
@@ -497,7 +491,7 @@ async def login_page(lang: str = "ko"):
     return base_html(content, lang)
 
 @app.post("/login")
-async def login(username: str = Form(...), password: str = Form(...), lang: str = Form("ko")):
+async def login(username: str = Form(...), password: str = Form(...), lang: str = Form("en")):
     username = username.strip().lower()
     user = users_db.get(username)
     if not user or user["password"] != hash_password(password):
@@ -520,7 +514,7 @@ async def logout(request: Request):
     return resp
 
 @app.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request, lang: str = "ko", result_id: str = None, error: str = None):
+async def dashboard(request: Request, lang: str = "en", result_id: str = None, error: str = None):
     user = get_current_user(request)
     if not user:
         return RedirectResponse(f"/login?lang={lang}", status_code=302)
@@ -544,70 +538,77 @@ async def dashboard(request: Request, lang: str = "ko", result_id: str = None, e
         <p style="font-size:1.25rem;margin:10px 0">{t('balance', lang)}: <strong>{user['credits']}</strong></p>
     </div>
     {result_block}
-    <div class="card">
-        <h3>{t('obfuscate', lang)}</h3>
-        <form method="post" action="/obfuscate">
+        <div class="card">
+        <h3>Obfuscate</h3>
+        <p class="muted">3 credits = 1 run (~1500 KRW per 3 credits). Paste code or upload a .lua / .txt file.</p>
+        <form method="post" action="/obfuscate" enctype="multipart/form-data">
             <input type="hidden" name="lang" value="{lang}">
-            <label>{t('intensity', lang)}</label>
+            <label>Version</label>
             <select name="intensity">
-                <option value="basic">{t('basic', lang)} (5+)</option>
-                <option value="strong" selected>{t('strong', lang)} (12+)</option>
-                <option value="extreme">{t('extreme', lang)} (25+)</option>
+                <option value="v1">Euana v1 (standard)</option>
+                <option value="v2" selected>Euana v2 (upgraded + VM)</option>
             </select>
-
-            <label>{t('options', lang)}</label>
-            <div class="opts">
-                <label><input type="checkbox" name="options" value="rename_vars" checked> {t('opt_rename', lang)} (+3)</label>
-                <label><input type="checkbox" name="options" value="encrypt_strings" checked> {t('opt_strings', lang)} (+5)</label>
-                <label><input type="checkbox" name="options" value="cff"> {t('opt_cff', lang)} (+8)</label>
-                <label><input type="checkbox" name="options" value="dead_code"> {t('opt_dead', lang)} (+4)</label>
-                <label><input type="checkbox" name="options" value="junk_code"> {t('opt_junk', lang)} (+3)</label>
-                <label><input type="checkbox" name="options" value="anti_tamper"> {t('opt_tamper', lang)} (+6)</label>
-                <label><input type="checkbox" name="options" value="minify"> {t('opt_minify', lang)} (+2)</label>
-                <label><input type="checkbox" name="options" value="opaque_predicates"> {t('opt_opaque', lang)} (+5)</label>
-                <label><input type="checkbox" name="options" value="proxy_functions"> {t('opt_proxy', lang)} (+4)</label>
-                <label><input type="checkbox" name="options" value="number_encrypt"> {t('opt_numbers', lang)} (+3)</label>
-            </div>
-
             <label>Code</label>
-            <textarea name="code" required placeholder="{t('code_placeholder', lang)}"></textarea>
-            <button type="submit">{t('submit', lang)}</button>
+            <textarea name="code" placeholder="Paste Luau / Lua code here (optional if you upload a file)"></textarea>
+            <label>Or upload file</label>
+            <input type="file" name="file" accept=".lua,.luau,.txt,.text">
+            <button type="submit">Obfuscate (3 credits)</button>
         </form>
     </div>
     <div class="card">
-        <h3>{t('charge', lang)}</h3>
+        <h3>Buy credits (Litecoin only)</h3>
+        <p class="muted">Pay with LTC only. 3 credits ≈ 1500 KRW. Submit txid after payment for admin approval.</p>
         <form method="post" action="/charge">
             <input type="hidden" name="lang" value="{lang}">
-            <label>Method</label>
-            <select name="method">
-                <option value="bank">{t('bank_transfer', lang)} (카카오뱅크)</option>
-                <option value="crypto">{t('crypto', lang)} (USDT)</option>
-            </select>
-            <label>{t('select_amount', lang)}</label>
-            <input type="number" name="amount" value="10000" min="1000" step="1000">
-            <button type="submit">{t('charge', lang)}</button>
+            <input type="hidden" name="method" value="crypto">
+            <label>Credits (multiples of 3)</label>
+            <input type="number" name="credits_buy" value="3" min="3" step="3">
+            <button type="submit">Get LTC address</button>
         </form>
-    </div>"""
+    </div>
+"""
     return base_html(content, lang, user)
 
+
 @app.post("/obfuscate")
-async def do_obfuscate(request: Request, code: str = Form(...), intensity: str = Form("strong"), lang: str = Form("ko")):
+async def do_obfuscate(
+    request: Request,
+    code: str = Form(""),
+    intensity: str = Form("v2"),
+    lang: str = Form("en"),
+    file: UploadFile = File(None),
+):
     user = get_current_user(request)
     if not user:
         return RedirectResponse(f"/login?lang={lang}", status_code=302)
 
-    form = await request.form()
-    options = form.getlist("options")
+    # File upload takes priority
+    if file and file.filename:
+        raw = await file.read()
+        try:
+            code = raw.decode("utf-8")
+        except Exception:
+            code = raw.decode("latin-1", errors="ignore")
 
-    cost = calc_cost(intensity, options)
+    code = (code or "").strip()
+    if len(code) < 5:
+        return RedirectResponse(
+            f"/dashboard?lang={lang}&error=Please paste code or upload a file",
+            status_code=302
+        )
+
+    if intensity not in ("v1", "v2"):
+        intensity = "v2"
+
+    cost = CREDITS_PER_OBFUSCATION
     if user["credits"] < cost:
         return RedirectResponse(
-            f"/dashboard?lang={lang}&error={t('insufficient_credit', lang)} (need {cost})",
+            f"/dashboard?lang={lang}&error=Insufficient credits (need {cost})",
             status_code=302
         )
 
     user["credits"] -= cost
-    result = obfuscate_code(code, intensity, options)
+    result = obfuscate_code(code, intensity, [])
 
     result_id = str(uuid.uuid4())[:8]
     if "results" not in user:
@@ -616,64 +617,60 @@ async def do_obfuscate(request: Request, code: str = Form(...), intensity: str =
 
     return RedirectResponse(f"/dashboard?lang={lang}&result_id={result_id}", status_code=302)
 
+
+
 @app.post("/charge")
-async def create_charge(request: Request, amount: float = Form(...), method: str = Form(...), lang: str = Form("ko")):
+async def create_charge(
+    request: Request,
+    credits_buy: int = Form(3),
+    method: str = Form("crypto"),
+    lang: str = Form("en"),
+):
     user = get_current_user(request)
     if not user:
         return RedirectResponse(f"/login?lang={lang}", status_code=302)
 
+    # Only Litecoin
+    method = "crypto"
+    credits_buy = max(3, int(credits_buy))
+    if credits_buy % 3 != 0:
+        credits_buy = credits_buy + (3 - credits_buy % 3)
+
     payment_id = str(uuid.uuid4())[:8]
-    credits = calc_credits(amount, method)
+    # Reference KRW value for display only
+    krw_value = (credits_buy / 3) * KRW_PER_3_CREDITS
+
     pending_payments[payment_id] = {
         "payment_id": payment_id,
         "username": user["username"],
-        "method": method,
-        "amount": amount,
-        "credits": credits,
+        "method": "ltc",
+        "amount": credits_buy,
+        "credits": credits_buy,
+        "krw_value": krw_value,
         "status": "pending",
         "created_at": datetime.utcnow().isoformat(),
     }
 
-    if method == "bank":
-        body = f"""
-        <div class="card">
-            <h3>{t('bank_transfer', lang)}</h3>
-            <p><strong>{BANK_INFO['bank']}</strong></p>
-            <p style="font-size:1.4rem;letter-spacing:1px">{BANK_INFO['account']}</p>
-            <p>예금주: {BANK_INFO['holder']}</p>
-            <p class="muted">금액: {amount:,.0f}원 → {credits} 크레딧</p>
-            <p class="muted">Payment ID: <code>{payment_id}</code></p>
-            <hr style="border-color:#334155;margin:20px 0">
-            <p>{t('after_transfer', lang)}</p>
-            <form method="post" action="/confirm-payment">
-                <input type="hidden" name="lang" value="{lang}">
-                <input type="hidden" name="payment_id" value="{payment_id}">
-                <label>{t('depositor_name', lang)}</label>
-                <input name="depositor_name" required placeholder="입금자명">
-                <button type="submit">{t('confirm_payment', lang)}</button>
-            </form>
-            <p style="margin-top:16px"><a href="/dashboard?lang={lang}" class="btn btn-outline">← Dashboard</a></p>
-        </div>"""
-    else:
-        body = f"""
-        <div class="card">
-            <h3>{t('crypto', lang)}</h3>
-            <p>{CRYPTO_INFO['currency']} ({CRYPTO_INFO['network']})</p>
-            <p style="font-size:1.1rem;word-break:break-all">{CRYPTO_INFO['address']}</p>
-            <p class="muted">Amount: {amount} {CRYPTO_INFO['currency']} → {credits} credits</p>
-            <p class="muted">Payment ID: <code>{payment_id}</code></p>
-            <hr style="border-color:#334155;margin:20px 0">
-            <p>{t('after_transfer', lang)}</p>
-            <form method="post" action="/confirm-payment">
-                <input type="hidden" name="lang" value="{lang}">
-                <input type="hidden" name="payment_id" value="{payment_id}">
-                <label>{t('tx_hash', lang)}</label>
-                <input name="tx_hash" required placeholder="Transaction Hash">
-                <button type="submit">{t('confirm_payment', lang)}</button>
-            </form>
-            <p style="margin-top:16px"><a href="/dashboard?lang={lang}" class="btn btn-outline">← Dashboard</a></p>
-        </div>"""
+    body = f"""
+    <div class="card">
+        <h3>Litecoin payment</h3>
+        <p><strong>{CRYPTO_INFO['currency']}</strong> ({CRYPTO_INFO['network']})</p>
+        <p style="font-size:1.1rem;word-break:break-all">{CRYPTO_INFO['address']}</p>
+        <p class="muted">Credits: <strong>{credits_buy}</strong> (ref. ~{krw_value:,.0f} KRW)</p>
+        <p class="muted">Payment ID: <code>{payment_id}</code></p>
+        <hr style="border-color:#334155;margin:20px 0">
+        <p>After sending LTC, paste the transaction ID below. Admin will approve and grant credits.</p>
+        <form method="post" action="/confirm-payment">
+            <input type="hidden" name="lang" value="{lang}">
+            <input type="hidden" name="payment_id" value="{payment_id}">
+            <label>Transaction ID (txid)</label>
+            <input name="tx_hash" required placeholder="LTC transaction id">
+            <button type="submit">Submit txid</button>
+        </form>
+        <p style="margin-top:16px"><a href="/dashboard?lang={lang}" class="btn btn-outline">← Dashboard</a></p>
+    </div>"""
     return HTMLResponse(base_html(body, lang, user))
+
 
 @app.post("/confirm-payment")
 async def confirm_payment(
@@ -681,7 +678,7 @@ async def confirm_payment(
     payment_id: str = Form(...),
     depositor_name: str = Form(None),
     tx_hash: str = Form(None),
-    lang: str = Form("ko")
+    lang: str = Form("en")
 ):
     user = get_current_user(request)
     if not user:
@@ -699,7 +696,7 @@ async def confirm_payment(
         # credits added only after /admin approve
 
     msg = {
-        "ko": "입금 확인 요청이 접수되었습니다. 관리자 승인 후 크레딧이 지급됩니다.",
+        "ko": "Payment proof submitted. Credits will be added after admin approval.",
         "en": "Payment proof submitted. Credits will be added after admin approval."
     }.get(lang, "Submitted. Waiting for admin approval.")
 
@@ -726,7 +723,7 @@ def get_admin(request: Request):
 
 
 @app.get("/admin", response_class=HTMLResponse)
-async def admin_page(request: Request, lang: str = "ko"):
+async def admin_page(request: Request, lang: str = "en"):
     if not get_admin(request):
         content = f"""
         <div class="card">
@@ -749,7 +746,7 @@ async def admin_page(request: Request, lang: str = "ko"):
 
     rows = ""
     if not pending:
-        rows = "<p class='muted'>대기 중인 결제가 없습니다.</p>"
+        rows = "<p class='muted'>No pending payments.</p>"
     else:
         for p in pending:
             dep = p.get("depositor_name") or p.get("tx_hash") or "-"
@@ -762,12 +759,12 @@ async def admin_page(request: Request, lang: str = "ko"):
                 <form method="post" action="/admin/approve" style="display:inline">
                     <input type="hidden" name="payment_id" value="{p['payment_id']}">
                     <input type="hidden" name="lang" value="{lang}">
-                    <button type="submit">승인 (크레딧 지급)</button>
+                    <button type="submit">Approve (grant credits)</button>
                 </form>
                 <form method="post" action="/admin/reject" style="display:inline;margin-left:8px">
                     <input type="hidden" name="payment_id" value="{p['payment_id']}">
                     <input type="hidden" name="lang" value="{lang}">
-                    <button type="submit" class="btn-outline" style="background:#7f1d1d;border-color:#7f1d1d">거절</button>
+                    <button type="submit" class="btn-outline" style="background:#7f1d1d;border-color:#7f1d1d">Reject</button>
                 </form>
             </div>"""
 
@@ -778,7 +775,7 @@ async def admin_page(request: Request, lang: str = "ko"):
     content = f"""
     <div class="card">
         <h2>Admin Dashboard</h2>
-        <p class="muted">대기 결제 승인 / 거절</p>
+        <p class="muted">Approve or reject pending payments</p>
         <p><a href="/admin/logout" class="btn btn-outline">Admin Logout</a></p>
     </div>
     <div class="card">
@@ -787,13 +784,13 @@ async def admin_page(request: Request, lang: str = "ko"):
     </div>
     <div class="card">
         <h3>Recent Completed</h3>
-        {done_rows or "<p class='muted'>없음</p>"}
+        {done_rows or "<p class='muted'>None</p>"}
     </div>"""
     return base_html(content, lang)
 
 
 @app.post("/admin/login")
-async def admin_login(username: str = Form(...), password: str = Form(...), lang: str = Form("ko")):
+async def admin_login(username: str = Form(...), password: str = Form(...), lang: str = Form("en")):
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
         token = create_token()
         admin_sessions.add(token)
@@ -819,7 +816,7 @@ async def admin_logout(request: Request):
 
 
 @app.post("/admin/approve")
-async def admin_approve(request: Request, payment_id: str = Form(...), lang: str = Form("ko")):
+async def admin_approve(request: Request, payment_id: str = Form(...), lang: str = Form("en")):
     if not get_admin(request):
         return RedirectResponse("/admin", status_code=302)
 
@@ -839,7 +836,7 @@ async def admin_approve(request: Request, payment_id: str = Form(...), lang: str
 
 
 @app.post("/admin/reject")
-async def admin_reject(request: Request, payment_id: str = Form(...), lang: str = Form("ko")):
+async def admin_reject(request: Request, payment_id: str = Form(...), lang: str = Form("en")):
     if not get_admin(request):
         return RedirectResponse("/admin", status_code=302)
 
@@ -859,8 +856,8 @@ async def admin_reject(request: Request, payment_id: str = Form(...), lang: str 
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    print(f"{APP_NAME} v{VERSION}")
+    print(f"{APP_NAME} Obfuscator v{VERSION}")
     print(f"Bank: {BANK_INFO['bank']} {BANK_INFO['account']} ({BANK_INFO['holder']})")
     print(f"Listening on port {port}")
-    print(f"Admin: /admin  (user={kimsiwoo} / pass={kimsiwoo})")
+    print(f"Admin: /admin  (user={ADMIN_USERNAME} / pass={ADMIN_PASSWORD})")
     uvicorn.run(app, host="0.0.0.0", port=port)
