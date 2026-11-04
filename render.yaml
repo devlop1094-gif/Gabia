@@ -1,3 +1,9 @@
+databases:
+  - name: euana-db
+    plan: free
+    databaseName: euana
+    user: euana
+
 services:
   - type: web
     name: euana
@@ -8,3 +14,7 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: DATABASE_URL
+        fromDatabase:
+          name: euana-db
+          property: connectionString
