@@ -1,7 +1,3 @@
-flask
-flask-sqlalchemy
-gunicorn
-psycopg2-binary
-psycopg[binary]
-flask-cors
-python-dotenv
+fastapi==0.115.6
+uvicorn==0.34.0
+python-multipart==0.0.20
