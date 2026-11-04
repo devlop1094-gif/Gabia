@@ -28,13 +28,8 @@ import string
 APP_NAME = "Euana"
 VERSION = "1.0.0"
 
-# Hosts: shop vs protect (same app, different pages)
-SHOP_HOSTS = {"daonshop.cloud", "www.daonshop.cloud"}
-PROTECT_HOSTS = {"api.daonshop.cloud"}
-# Shared cookie domain so login works on both hosts
-COOKIE_DOMAIN = os.environ.get("COOKIE_DOMAIN", ".daonshop.cloud")
-SHOP_URL = os.environ.get("SHOP_URL", "https://daonshop.cloud")
-PROTECT_URL = os.environ.get("PROTECT_URL", "https://api.daonshop.cloud")
+# Single domain – shop + obfuscation are different paths (no subdomain)
+# SHOP_PATH = /shop   OBF_PATH = /obfuscate
 
 # Pricing: $2 = 3 credits (1 obfuscation costs 3 credits)
 CREDITS_PER_OBFUSCATION = 3
@@ -591,48 +586,39 @@ app = FastAPI(title=APP_NAME, version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
-def request_host(request: Request) -> str:
-    host = (request.headers.get("host") or "").split(":")[0].lower().strip()
-    return host
-
 def get_site(request: Request) -> str:
-    """Return 'shop' or 'protect' based on Host header."""
-    host = request_host(request)
-    if host in PROTECT_HOSTS or host.startswith("api."):
-        return "protect"
+    """Return 'shop' or 'api' from URL path (single domain, no subdomain)."""
+    p = request.url.path or "/"
+    if p.startswith("/obfuscate") or p.startswith("/download"):
+        return "api"
     return "shop"
 
 def site_title(site: str) -> str:
-    if site == "protect":
-        return f"{APP_NAME} Protect"
+    if site == "api":
+        return APP_NAME
     return "DaonShop"
 
 def set_session_cookie(resp, token: str):
-    kwargs = dict(httponly=True, max_age=60*60*24*30, samesite="lax")
-    # Only set Domain on real daonshop hosts (not localhost)
-    if COOKIE_DOMAIN and "daonshop" in (COOKIE_DOMAIN or ""):
-        kwargs["domain"] = COOKIE_DOMAIN
-        kwargs["secure"] = True
-    resp.set_cookie("session", token, **kwargs)
+    resp.set_cookie("session", token, httponly=True, max_age=60*60*24*30, samesite="lax")
     return resp
 
 def base_html(content: str, lang: str = "en", user=None, site: str = "shop"):
     balance = user["credits"] if user else 0
     username = user["username"] if user else ""
     title = site_title(site)
-    brand = "DaonShop" if site == "shop" else "Euana"
+    brand = "DaonShop" if site == "shop" else APP_NAME
     # sidebar nav
     if site == "shop":
-        nav_items = f"""
-        <a class="nav-item" href="/dashboard"><span class="ico">▦</span> Dashboard</a>
-        <a class="nav-item" href="/dashboard#purchase"><span class="ico">🛒</span> Purchase</a>
-        <a class="nav-item" href="{PROTECT_URL}/dashboard"><span class="ico">◎</span> Obfuscation</a>
+        nav_items = """
+        <a class="nav-item" href="/shop"><span class="ico">▦</span> Dashboard</a>
+        <a class="nav-item" href="/shop#purchase"><span class="ico">🛒</span> Purchase</a>
+        <a class="nav-item" href="/obfuscate"><span class="ico">◎</span> Obfuscation</a>
         """
     else:
-        nav_items = f"""
-        <a class="nav-item" href="/dashboard"><span class="ico">◎</span> Obfuscation</a>
-        <a class="nav-item" href="{SHOP_URL}/dashboard"><span class="ico">🛒</span> Purchase</a>
-        <a class="nav-item" href="/dashboard"><span class="ico">▦</span> Dashboard</a>
+        nav_items = """
+        <a class="nav-item" href="/obfuscate"><span class="ico">◎</span> Obfuscation</a>
+        <a class="nav-item" href="/shop"><span class="ico">🛒</span> Purchase</a>
+        <a class="nav-item" href="/shop"><span class="ico">▦</span> Dashboard</a>
         """
     user_block = ""
     if user:
@@ -697,18 +683,39 @@ pre.result{{background:#0f172a;color:#e2e8f0;padding:16px;border-radius:12px;ove
 .success{{color:#059669}}
 .error{{color:#dc2626}}
 label{{font-size:13px;color:var(--muted);font-weight:600}}
-.topbar{{display:none}}
+.topbar{{display:none;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--card);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:20}}
+.topbar .menu-btn,.sidebar .close-btn{{background:var(--purple-soft);color:var(--purple);border:none;border-radius:10px;width:40px;height:40px;font-size:18px;cursor:pointer;font-weight:700}}
+.sidebar .brand-row{{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}}
+.sidebar .close-btn{{display:none}}
 @media(max-width:800px){{
+  .topbar{{display:flex}}
   .layout{{flex-direction:column}}
-  .sidebar{{width:100%;height:auto;position:relative;border-right:none;border-bottom:1px solid var(--border)}}
+  .sidebar{{
+    width:min(300px,86vw);height:100vh;position:fixed;top:0;left:0;z-index:40;
+    border-right:1px solid var(--border);transform:translateX(-105%);transition:transform .2s ease;
+    box-shadow:var(--shadow);
+  }}
+  .sidebar.open{{transform:translateX(0)}}
+  .sidebar .close-btn{{display:inline-flex;align-items:center;justify-content:center}}
+  .sidebar-backdrop{{display:none;position:fixed;inset:0;background:rgba(15,23,42,.35);z-index:30}}
+  .sidebar-backdrop.show{{display:block}}
   .main{{padding:18px}}
 }}
 </style>
 </head>
 <body>
+<div class="topbar">
+  <button type="button" class="menu-btn" onclick="openNav()" aria-label="Open menu">☰</button>
+  <div style="font-weight:800;color:var(--purple)">{brand}</div>
+  <button type="button" class="menu-btn" onclick="tryCloseTab()" title="Close" aria-label="Close">✕</button>
+</div>
+<div class="sidebar-backdrop" id="navBackdrop" onclick="closeNav()"></div>
 <div class="layout">
-  <aside class="sidebar">
-    <div class="brand"><div class="logo">🔒</div>{brand}</div>
+  <aside class="sidebar" id="sidebar">
+    <div class="brand-row">
+      <div class="brand" style="padding:0;margin:0"><div class="logo">🔒</div>{brand}</div>
+      <button type="button" class="close-btn" onclick="closeNav()" aria-label="Close menu">✕</button>
+    </div>
     {nav_items}
     {user_block}
   </aside>
@@ -716,6 +723,21 @@ label{{font-size:13px;color:var(--muted);font-weight:600}}
     {content}
   </main>
 </div>
+<script>
+function openNav(){{
+  document.getElementById('sidebar').classList.add('open');
+  document.getElementById('navBackdrop').classList.add('show');
+}}
+function closeNav(){{
+  document.getElementById('sidebar').classList.remove('open');
+  document.getElementById('navBackdrop').classList.remove('show');
+}}
+function tryCloseTab(){{
+  // works when this tab was opened by script; otherwise go home
+  window.close();
+  setTimeout(function(){{ window.location.href='/'; }}, 150);
+}}
+</script>
 </body>
 </html>"""
 
@@ -761,27 +783,27 @@ async def home(request: Request, lang: str = "en"):
     site = get_site(request)
     user = get_current_user(request)
     if user:
-        return RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
-    if site == "protect":
+        return RedirectResponse(f"/shop?lang={lang}", status_code=302)
+    if site == "api":
         content = f"""
         <div class="card">
-            <h2>Euana Protect</h2>
-            <p class="muted" style="margin:12px 0 24px">Luau / Lua obfuscation dashboard. Buy credits on the shop, then protect your scripts here.</p>
+            <h2>Euana</h2>
+            <p class="muted" style="margin:12px 0 24px">Luau / Lua obfuscation dashboard. Buy credits on the shop, then obfuscate your scripts here.</p>
             <div class="row">
                 <a class="btn" href="/login?lang={lang}">{t('login', lang)}</a>
                 <a class="btn btn-outline" href="/register?lang={lang}">{t('register', lang)}</a>
-                <a class="btn btn-outline" href="{SHOP_URL}">Buy credits (Shop)</a>
+                <a class="btn btn-outline" href="/shop">Buy credits (Shop)</a>
             </div>
         </div>"""
     else:
         content = f"""
         <div class="card">
             <h2>DaonShop</h2>
-            <p class="muted" style="margin:12px 0 24px">Credit shop for Euana Protect. $2 = 3 credits. Pay with Litecoin, then obfuscate on Protect.</p>
+            <p class="muted" style="margin:12px 0 24px">Credit shop for Euana. $2 = 3 credits. Pay with Litecoin, then go to Obfuscation.</p>
             <div class="row">
                 <a class="btn" href="/login?lang={lang}">{t('login', lang)}</a>
                 <a class="btn btn-outline" href="/register?lang={lang}">{t('register', lang)}</a>
-                <a class="btn btn-outline" href="{PROTECT_URL}">Open Protect</a>
+                <a class="btn btn-outline" href="/obfuscate">Open Euana</a>
             </div>
         </div>"""
     return base_html(content, lang, site=site)
@@ -828,7 +850,7 @@ async def register(username: str = Form(...), password: str = Form(...), lang: s
         content = f"""<div class="card"><p class="error">DB error: {html_lib.escape(str(e))}</p>
         <a class="btn" href="/register?lang={lang}">{t('register', lang)}</a></div>"""
         return HTMLResponse(base_html(content, lang))
-    resp = RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
+    resp = RedirectResponse(f"/shop?lang={lang}", status_code=302)
     set_session_cookie(resp, token)
     return resp
 
@@ -869,7 +891,7 @@ async def login(username: str = Form(...), password: str = Form(...), lang: str 
         content = f"""<div class="card"><p class="error">DB error: {html_lib.escape(str(e))}</p>
         <a class="btn" href="/login?lang={lang}">{t('login', lang)}</a></div>"""
         return HTMLResponse(base_html(content, lang))
-    resp = RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
+    resp = RedirectResponse(f"/shop?lang={lang}", status_code=302)
     set_session_cookie(resp, token)
     return resp
 
@@ -885,9 +907,12 @@ async def logout(request: Request):
     resp.delete_cookie("session")
     return resp
 
+@app.get("/shop", response_class=HTMLResponse)
+@app.get("/obfuscate", response_class=HTMLResponse)
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard(request: Request, lang: str = "en", result_id: str = None, error: str = None):
-    site = get_site(request)
+    p = request.url.path or ""
+    site = "api" if p.startswith("/obfuscate") else "shop"
     user = get_current_user(request)
     if not user:
         return RedirectResponse(f"/login?lang={lang}", status_code=302)
@@ -910,17 +935,17 @@ async def dashboard(request: Request, lang: str = "en", result_id: str = None, e
 
     balance_card = f"""
     <div class="card">
-        <h2>{"Protect Dashboard" if site == "protect" else "Shop Dashboard"}</h2>
+        <h2>{"Euana Dashboard" if site == "api" else "Shop Dashboard"}</h2>
         <p style="font-size:1.25rem;margin:10px 0">{t('balance', lang)}: <strong>{user['credits']}</strong></p>
     </div>
     """
 
-    if site == "protect":
+    if site == "api":
         content = balance_card + result_block + f"""
     <div class="card">
         <h3>Obfuscate</h3>
         <p class="muted">3 credits = 1 run. Paste code or upload a .lua / .txt file. Buy credits at the shop if needed.</p>
-        <p class="muted" style="margin-bottom:12px"><a href="{SHOP_URL}/dashboard" style="color:#a5b4fc">→ Buy credits on DaonShop</a></p>
+        <p class="muted" style="margin-bottom:12px"><a href="/shop" style="color:#a5b4fc">→ Buy credits on DaonShop</a></p>
         <form method="post" action="/obfuscate" enctype="multipart/form-data">
             <input type="hidden" name="lang" value="{lang}">
             <label>Version</label>
@@ -1004,9 +1029,9 @@ async def dashboard(request: Request, lang: str = "en", result_id: str = None, e
         </div>
     </div>
     <div class="card">
-        <h3>Euana Protect</h3>
-        <p class="muted" style="margin-bottom:12px">Use credits on the protect dashboard to obfuscate Luau / Lua scripts.</p>
-        <a class="btn" href="{PROTECT_URL}/dashboard">Open Obfuscation</a>
+        <h3>Euana</h3>
+        <p class="muted" style="margin-bottom:12px">Use credits on the Obfuscation page to obfuscate Luau / Lua scripts.</p>
+        <a class="btn" href="/obfuscate">Open Obfuscation</a>
     </div>
 """
     return base_html(content, lang, user, site=site)
@@ -1037,7 +1062,7 @@ async def do_obfuscate(
     code = (code or "").strip()
     if len(code) < 5:
         return RedirectResponse(
-            f"/dashboard?lang={lang}&error=Please paste code or upload a file",
+            f"/obfuscate?lang={lang}&error=Please paste code or upload a file",
             status_code=302
         )
 
@@ -1047,7 +1072,7 @@ async def do_obfuscate(
     cost = CREDITS_PER_OBFUSCATION
     if user["credits"] < cost:
         return RedirectResponse(
-            f"/dashboard?lang={lang}&error=Insufficient credits (need {cost})",
+            f"/obfuscate?lang={lang}&error=Insufficient credits (need {cost})",
             status_code=302
         )
 
@@ -1060,7 +1085,7 @@ async def do_obfuscate(
     user["results"][result_id] = result
     save_user(user)
 
-    return RedirectResponse(f"{PROTECT_URL}/dashboard?lang={lang}&result_id={result_id}", status_code=302)
+    return RedirectResponse(f"/obfuscate?lang={lang}&result_id={result_id}", status_code=302)
 
 
 @app.get("/download/{result_id}")
@@ -1071,7 +1096,7 @@ async def download_result(request: Request, result_id: str):
     results = user.get("results") or {}
     content = results.get(result_id)
     if not content:
-        return RedirectResponse("/dashboard?error=Result+not+found", status_code=302)
+        return RedirectResponse("/obfuscate?error=Result+not+found", status_code=302)
     filename = f"obfuscated_{result_id}.lua"
     return Response(
         content=content,
@@ -1128,7 +1153,7 @@ async def create_charge(
             <input name="tx_hash" required placeholder="LTC transaction id">
             <button type="submit">Submit txid</button>
         </form>
-        <p style="margin-top:16px"><a href="/dashboard?lang={lang}" class="btn btn-outline">← Dashboard</a></p>
+        <p style="margin-top:16px"><a href="/shop?lang={lang}" class="btn btn-outline">← Shop</a></p>
     </div>"""
     return HTMLResponse(base_html(body, lang, user))
 
@@ -1149,7 +1174,7 @@ async def confirm_payment(
     row = conn.execute("SELECT * FROM payments WHERE payment_id=?", (payment_id,)).fetchone()
     if not row or row["username"] != user["username"]:
         conn.close()
-        return RedirectResponse(f"/dashboard?lang={lang}&error=Payment not found", status_code=302)
+        return RedirectResponse(f"/shop?lang={lang}&error=Payment not found", status_code=302)
 
     payment = dict(row)
     if payment["status"] == "pending":
@@ -1167,7 +1192,7 @@ async def confirm_payment(
         <h3 class="success">{msg}</h3>
         <p>Payment ID: <code>{payment_id}</code></p>
         <p>{t('balance', lang)}: {user['credits']} (pending +{payment['credits']})</p>
-        <a class="btn" href="/dashboard?lang={lang}">Dashboard</a>
+        <a class="btn" href="/shop?lang={lang}">Shop</a>
     </div>"""
     return HTMLResponse(base_html(content, lang, user))
 
