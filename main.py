@@ -1,849 +1,866 @@
-import os, secrets, json, urllib.request
+from fastapi import FastAPI, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
-from functools import wraps
-from flask import Flask, request, redirect, session, flash, send_file, abort, get_flashed_messages, jsonify
-from flask_sqlalchemy import SQLAlchemy
-from flask_cors import CORS
-from werkzeug.security import generate_password_hash, check_password_hash
-from werkzeug.utils import secure_filename
+from typing import List
+import secrets
+import hashlib
+import uuid
+import re
+import html as html_lib
+import os
+import random
+import string
 
-# .env 지원 (선택)
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
+# ======================
+# Config
+# ======================
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "daon-class-2026-secret")
+APP_NAME = "VeilObfuscator"
+VERSION = "0.3.0"
 
-# CORS
-CORS(app, resources={
-    r"/api/*": {
-        "origins": [
-            "https://daonshop.cloud",
-            "https://www.daonshop.cloud",
-            
-            "http://localhost:5000",
-            "http://127.0.0.1:5000",
-        ],
-        "supports_credentials": True,
+CREDIT_RATES = {
+    "KRW": 100,
+    "USDT": 0.01,
+}
+
+BANK_INFO = {
+    "bank": "카카오뱅크",
+    "account": "7777-03-0806539",
+    "holder": "김시우",
+}
+
+CRYPTO_INFO = {
+    "network": "TRC20",
+    "currency": "USDT",
+    "address": "COMING_SOON",
+}
+
+# Admin
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "admin1234"  # 배포 전 꼭 변경
+admin_sessions = set()
+
+BASE_COST = {
+    "basic": 5,
+    "strong": 12,
+    "extreme": 25,
+}
+
+OPTION_COST = {
+    "rename_vars": 3,
+    "encrypt_strings": 5,
+    "cff": 8,
+    "dead_code": 4,
+    "junk_code": 3,
+    "anti_tamper": 6,
+    "minify": 2,
+    "opaque_predicates": 5,
+    "proxy_functions": 4,
+    "number_encrypt": 3,
+}
+
+users_db = {}
+sessions = {}
+pending_payments = {}
+
+# ======================
+# Language
+# ======================
+
+LANG = {
+    "ko": {
+        "app_name": "VeilObfuscator",
+        "welcome": "VeilObfuscator에 오신 것을 환영합니다",
+        "register": "회원가입",
+        "login": "로그인",
+        "logout": "로그아웃",
+        "username": "아이디",
+        "password": "비밀번호",
+        "balance": "보유 크레딧",
+        "charge": "크레딧 충전",
+        "obfuscate": "난독화 하기",
+        "bank_transfer": "계좌이체",
+        "crypto": "코인 결제",
+        "select_amount": "충전 금액",
+        "after_transfer": "입금 후 입금자명 또는 TxHash를 입력하고 확인을 눌러주세요",
+        "depositor_name": "입금자명",
+        "tx_hash": "트랜잭션 해시 (TxID)",
+        "confirm_payment": "결제 확인 요청",
+        "insufficient_credit": "크레딧이 부족합니다. 충전이 필요합니다.",
+        "obfuscate_success": "난독화가 완료되었습니다",
+        "result": "난독화 결과",
+        "copy": "복사하기",
+        "dashboard": "대시보드",
+        "code_placeholder": "여기에 Luau / Lua 코드를 붙여넣으세요",
+        "intensity": "기본 강도",
+        "basic": "Basic",
+        "strong": "Strong",
+        "extreme": "Extreme",
+        "submit": "실행",
+        "payment_submitted": "결제 확인 요청이 접수되었습니다. 확인 후 크레딧이 지급됩니다.",
+        "already_exists": "이미 존재하는 아이디입니다",
+        "invalid_login": "아이디 또는 비밀번호가 올바르지 않습니다",
+        "options": "추가 옵션",
+        "opt_rename": "변수/함수 이름 섞기",
+        "opt_strings": "문자열 암호화",
+        "opt_cff": "Control Flow Flattening",
+        "opt_dead": "Dead Code 삽입",
+        "opt_junk": "Junk Code 삽입",
+        "opt_tamper": "Anti-Tamper",
+        "opt_minify": "공백/주석 제거",
+        "opt_opaque": "Opaque Predicates",
+        "opt_proxy": "Proxy Functions",
+        "opt_numbers": "숫자 암호화",
+    },
+    "en": {
+        "app_name": "VeilObfuscator",
+        "welcome": "Welcome to VeilObfuscator",
+        "register": "Sign Up",
+        "login": "Login",
+        "logout": "Logout",
+        "username": "Username",
+        "password": "Password",
+        "balance": "Credit Balance",
+        "charge": "Charge Credits",
+        "obfuscate": "Obfuscate",
+        "bank_transfer": "Bank Transfer",
+        "crypto": "Crypto Payment",
+        "select_amount": "Amount",
+        "after_transfer": "After payment, enter depositor name or TxHash and confirm",
+        "depositor_name": "Depositor Name",
+        "tx_hash": "Transaction Hash (TxID)",
+        "confirm_payment": "Submit Payment Proof",
+        "insufficient_credit": "Insufficient credits. Please charge.",
+        "obfuscate_success": "Obfuscation completed",
+        "result": "Obfuscation Result",
+        "copy": "Copy",
+        "dashboard": "Dashboard",
+        "code_placeholder": "Paste your Luau / Lua code here",
+        "intensity": "Base Intensity",
+        "basic": "Basic",
+        "strong": "Strong",
+        "extreme": "Extreme",
+        "submit": "Run",
+        "payment_submitted": "Payment proof submitted. Credits will be added after verification.",
+        "already_exists": "Username already exists",
+        "invalid_login": "Invalid username or password",
+        "options": "Extra Options",
+        "opt_rename": "Rename Variables / Functions",
+        "opt_strings": "Encrypt Strings",
+        "opt_cff": "Control Flow Flattening",
+        "opt_dead": "Insert Dead Code",
+        "opt_junk": "Insert Junk Code",
+        "opt_tamper": "Anti-Tamper",
+        "opt_minify": "Minify (remove comments/whitespace)",
+        "opt_opaque": "Opaque Predicates",
+        "opt_proxy": "Proxy Functions",
+        "opt_numbers": "Encrypt Numbers",
     }
-})
+}
 
-db_url = os.environ.get("DATABASE_URL", "")
-if db_url:
-    if db_url.startswith("postgres://"):
-        db_url = db_url.replace("postgres://", "postgresql://", 1)
-    # Render 등에서 psycopg2 사용하도록 명시
-    if db_url.startswith("postgresql://") and "+psycopg" not in db_url and "+psycopg2" not in db_url:
-        db_url = db_url.replace("postgresql://", "postgresql+psycopg2://", 1)
-    app.config["SQLALCHEMY_DATABASE_URI"] = db_url
-else:
-    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///daon.db"
-app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-os.makedirs("uploads", exist_ok=True)
-db = SQLAlchemy(app)
+def t(key: str, lang: str = "ko") -> str:
+    return LANG.get(lang, LANG["ko"]).get(key, key)
 
-# ===== 은행 정보 =====
-BANK_NAME = "카카오뱅크"
-BANK_ACCOUNT = "7777-03-0806539"
-BANK_HOLDER = "김시우"
+# ======================
+# Helpers
+# ======================
 
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
 
-# ===== 상담 봇 (규칙 기반 FAQ - API 크레딧 없음) =====
-FAQ_RESPONSES = [
-    {
-        "keywords": ["입금", "계좌", "은행", "송금", "무통장", "결제 방법", "결제방법", "어떻게 내", "돈"],
-        "reply": "무통장 입금으로 결제해 주세요.\n\n🏦 은행: 카카오뱅크\n계좌번호: 7777-03-0806539\n예금주: 김시우\n\n금액을 정확히 입금해 주시면 확인 후 '내 강의'에서 PDF를 받으실 수 있습니다."
-    },
-    {
-        "keywords": ["가격", "얼마", "비용", "금액", "원"],
-        "reply": "현재 판매 중인 강의 가격은 다음과 같습니다.\n\n• 유튜브 100만 기법 - 99,000원\n• 1달 300 기법 - 79,000원\n• 엑셀 업무 자동화 - 59,000원\n• 네이버 블로그 자동화 - 69,000원\n\n상세 페이지에서 확인하실 수 있어요!"
-    },
-    {
-        "keywords": ["유튜브", "100만", "구독"],
-        "reply": "「유튜브 100만 기법」은 유튜브 채널을 100만 구독자까지 성장시키는 실전 기법 강의입니다.\n가격: 99,000원\n\n구매 후 PDF로 바로 받아보실 수 있어요."
-    },
-    {
-        "keywords": ["1달", "300", "한달"],
-        "reply": "「1달 300 기법」은 단 한 달 만에 결과를 만드는 300가지 실전 기법 강의입니다.\n가격: 79,000원"
-    },
-    {
-        "keywords": ["엑셀", "자동화", "업무"],
-        "reply": "「엑셀 업무 자동화」는 반복되는 엑셀 업무를 자동화하는 실무 테크닉 강의입니다.\n가격: 59,000원"
-    },
-    {
-        "keywords": ["네이버", "블로그"],
-        "reply": "「네이버 블로그 자동화」는 네이버 블로그 운영을 자동화해서 트래픽과 수익을 만드는 방법 강의입니다.\n가격: 69,000원"
-    },
-    {
-        "keywords": ["구매", "사는법", "사는 방법", "어떻게 사", "주문"],
-        "reply": "구매 방법:\n1. 회원가입 / 로그인\n2. 원하는 강의 '상세보기' → '구매하기'\n3. 안내된 계좌로 입금\n4. 관리자 확인 후 '내 강의'에서 PDF 다운로드\n\n이미 구매한 강의는 다시 구매할 수 없습니다."
-    },
-    {
-        "keywords": ["pdf", "다운로드", "다운", "파일"],
-        "reply": "결제(입금)가 확인되면 '내 강의' 메뉴에서 PDF를 다운로드할 수 있습니다.\n아직 입금 대기 중이라면 조금만 기다려 주세요!"
-    },
-    {
-        "keywords": ["로그인", "회원가입", "가입", "계정"],
-        "reply": "우측 상단에서 '회원가입' 또는 '로그인'을 할 수 있습니다.\n가입 후 강의를 구매하고 '내 강의'에서 PDF를 받으세요."
-    },
-    {
-        "keywords": ["관리자", "문의", "연락", "고객센터", "헬프"],
-        "reply": "추가 문의가 필요하시면 관리자에게 직접 문의해 주세요.\n입금 확인이나 특별한 요청은 관리자 확인이 필요합니다."
-    },
-    {
-        "keywords": ["로블록스", "roblox", "로블", "계정", "계정 구매", "계정사"],
-        "reply": "로블록스 계정은 /roblox 페이지에서 구매하실 수 있습니다.\n\n🏦 은행: 카카오뱅크\n계좌번호: 7777-03-0806539\n예금주: 김시우\n\n원하는 계정을 선택 후 입금해 주시면 확인 후 계정 정보를 전달해 드립니다."
-    },
-    {
-        "keywords": ["안녕", "하이", "헬로", "ㅎㅇ", "안녕하세요"],
-        "reply": "안녕하세요! 다온 클래스 상담봇입니다 😊\n강의 안내, 가격, 입금 방법, 구매 방법, 로블록스 계정 등 궁금한 점을 편하게 물어보세요."
-    },
-]
+def create_token() -> str:
+    return secrets.token_hex(24)
 
-DEFAULT_REPLY = "죄송해요, 정확히 이해하지 못했어요.\n\n이런 내용을 물어보실 수 있어요:\n• 입금 / 계좌번호\n• 강의 가격\n• 구매 방법\n• PDF 다운로드\n• 특정 강의 소개\n\n다시 한 번 물어봐 주세요!"
+def get_current_user(request: Request):
+    token = request.cookies.get("session")
+    if not token or token not in sessions:
+        return None
+    return users_db.get(sessions[token])
 
-def get_bot_reply(message: str) -> str:
-    msg = (message or "").lower().strip()
-    if not msg:
-        return DEFAULT_REPLY
-    for item in FAQ_RESPONSES:
-        for kw in item["keywords"]:
-            if kw in msg:
-                return item["reply"]
-    return DEFAULT_REPLY
+def calc_credits(amount: float, method: str) -> int:
+    if method == "bank":
+        return max(1, int(amount / CREDIT_RATES["KRW"]))
+    return max(1, int(amount / CREDIT_RATES["USDT"]))
+
+def rand_name(length: int = 8) -> str:
+    return "_" + "".join(random.choices(string.ascii_letters, k=length))
 
 
-def fetch_account_lines(url: str) -> list:
-    """GitHub raw URL에서 계정 목록(한 줄 = 1계정)을 가져온다."""
-    if not url or not url.strip():
-        return []
-    try:
-        req = urllib.request.Request(url.strip(), headers={"User-Agent": "DaonClass/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            text = resp.read().decode("utf-8", errors="ignore")
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not ln.strip().startswith("#")]
-        return lines
-    except Exception as e:
-        print(f"[account] fetch failed: {e}")
-        return []
+# ======================
+# Obfuscation Engine (with simple VM)
+# ======================
 
+def _xor_string(s: str, key: int = 0x5A) -> str:
+    encoded = "".join(chr(ord(c) ^ key) for c in s)
+    encoded = encoded.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n").replace("\r", "")
+    return encoded
 
-def assign_accounts_from_url(product, count: int = 1) -> str:
+def _make_string_decryptor(key: int = 0x5A) -> str:
+    return f"local function _S(s)local r=''for i=1,#s do r=r..string.char(string.byte(s,i)~{key})end return r end"
+
+def _encrypt_number(n: int) -> str:
+    a = random.randint(17, 97)
+    b = n + a
+    return f"({b}-{a})"
+
+def _rand_ident(n: int = 8) -> str:
+    return "_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+
+def _generate_vm(bytecode: list, intensity: str) -> str:
     """
-    GitHub raw 목록에서 아직 지급되지 않은 계정을 count개 가져와
-    줄바꿈으로 이은 문자열로 반환. 부족하면 있는 만큼만.
+    Simple stack-based VM wrapper.
+    bytecode items: ("PUSHSTR", str), ("PUSHNUM", int), ("CALL", name), ("RET",)
     """
-    url = (product.account_list_url or "").strip()
-    if not url:
-        return ""
-    all_lines = fetch_account_lines(url)
-    if not all_lines:
-        return ""
-    # 이미 지급된 계정 모음
-    used = set()
-    for o in Order.query.filter(Order.delivered_account.isnot(None), Order.delivered_account != "").all():
-        for line in (o.delivered_account or "").splitlines():
-            line = line.strip()
-            if line:
-                used.add(line)
-    available = [ln for ln in all_lines if ln not in used]
-    take = available[:max(1, count)]
-    return "\n".join(take)
+    pc_name = _rand_ident(5)
+    stack_name = _rand_ident(5)
+    code_name = _rand_ident(6)
+    op_name = _rand_ident(4)
 
+    # Encode strings in bytecode
+    key = random.randint(0x20, 0x7F)
+    encrypted_chunks = []
+    for item in bytecode:
+        if item[0] == "PUSHSTR":
+            encrypted_chunks.append((_xor_string(item[1], key), "str"))
+        elif item[0] == "PUSHNUM":
+            encrypted_chunks.append((str(item[1]), "num"))
+        else:
+            encrypted_chunks.append((item[0], "op"))
 
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(80), unique=True, nullable=False)
-    email = db.Column(db.String(120), default="")
-    password_hash = db.Column(db.String(200), nullable=False)
-    is_admin = db.Column(db.Boolean, default=False)
-    def set_password(self, pw): self.password_hash = generate_password_hash(pw)
-    def check_password(self, pw): return check_password_hash(self.password_hash, pw)
+    # Build data table
+    data_lines = []
+    for i, (val, typ) in enumerate(encrypted_chunks):
+        if typ == "str":
+            data_lines.append(f"[{i+1}]=_S('{val}')")
+        elif typ == "num":
+            data_lines.append(f"[{i+1}]={val}")
+        else:
+            data_lines.append(f"[{i+1}]='{val}'")
 
-class Product(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    title = db.Column(db.String(200), nullable=False)
-    description = db.Column(db.Text, default="")
-    price = db.Column(db.Integer, nullable=False)
-    pdf_filename = db.Column(db.String(300), default="")
-    is_active = db.Column(db.Boolean, default=True)
-    stock = db.Column(db.Integer, default=999)  # 재고 (로블록스 계정 등)
-    account_list_url = db.Column(db.String(500), default="")  # GitHub raw 계정 목록 URL
+    data_tbl = ",".join(data_lines)
 
-class Order(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    order_id = db.Column(db.String(64), unique=True)
-    user_id = db.Column(db.Integer, db.ForeignKey("user.id"))
-    product_id = db.Column(db.Integer, db.ForeignKey("product.id"))
-    amount = db.Column(db.Integer)
-    status = db.Column(db.String(20), default="pending")
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    paid_at = db.Column(db.DateTime, nullable=True)
-    delivered_account = db.Column(db.Text, default="")  # 지급된 로블록스 계정 정보
-    user = db.relationship("User", backref="orders")
-    product = db.relationship("Product", backref="orders")
+    vm = f"""
+{_make_string_decryptor(key)}
+local {code_name}={{{data_tbl}}}
+local {stack_name}={{}}
+local {pc_name}=1
+while {pc_name}<=#{code_name} do
+local {op_name}={code_name}[{pc_name}]
+{pc_name}={pc_name}+1
+if type({op_name})=="string" and #{op_name}>3 and string.sub({op_name},1,1)~="_" then
+-- opcode
+if {op_name}=="CALL" then
+local fn=table.remove({stack_name})
+local arg=table.remove({stack_name})
+if type(fn)=="function" then fn(arg) end
+elseif {op_name}=="RET" then break
+end
+else
+table.insert({stack_name},{op_name})
+end
+end
+"""
+    return vm.strip()
 
-with app.app_context():
-    db.create_all()
-
-    # 기존 DB에 새 컬럼이 없으면 추가 (Render 등 기존 테이블 대응)
-    try:
-        from sqlalchemy import text, inspect
-        inspector = inspect(db.engine)
-        # product 테이블
-        prod_cols = [c["name"] for c in inspector.get_columns("product")]
-        with db.engine.begin() as conn:
-            if "stock" not in prod_cols:
-                conn.execute(text("ALTER TABLE product ADD COLUMN stock INTEGER DEFAULT 999"))
-                print("[migrate] product.stock column added")
-            if "account_list_url" not in prod_cols:
-                conn.execute(text("ALTER TABLE product ADD COLUMN account_list_url VARCHAR(500) DEFAULT ''"))
-                print("[migrate] product.account_list_url column added")
-        # order 테이블
-        order_cols = [c["name"] for c in inspector.get_columns("order")]
-        with db.engine.begin() as conn:
-            if "delivered_account" not in order_cols:
-                conn.execute(text("ALTER TABLE \"order\" ADD COLUMN delivered_account TEXT DEFAULT ''"))
-                print("[migrate] order.delivered_account column added")
-    except Exception as e:
-        print(f"[migrate] column check/add skipped: {e}")
-
-    # 관리자 계정 강제 생성/업데이트 (kimsiwoo / kimsiwoo)
-    admin = User.query.filter_by(username="kimsiwoo").first()
-    if not admin:
-        admin = User(username="kimsiwoo", email="admin@daonshop.cloud", is_admin=True)
-        admin.set_password("kimsiwoo")
-        db.session.add(admin)
-    else:
-        admin.is_admin = True
-        admin.set_password("kimsiwoo")
-    db.session.commit()
-
-    if Product.query.count() == 0:
-        for t,d,p in [
-            ("유튜브 100만 기법","유튜브 채널을 100만 구독자까지 성장시키는 실전 기법.",99000),
-            ("1달 300 기법","단 한 달 만에 결과를 만드는 300가지 실전 기법.",79000),
-            ("엑셀 업무 자동화","반복되는 엑셀 업무를 자동화하는 실무 테크닉.",59000),
-            ("네이버 블로그 자동화","네이버 블로그 운영을 자동화해서 트래픽과 수익을 만드는 방법.",69000),
-        ]:
-            db.session.add(Product(title=t, description=d, price=p, stock=999))
-        db.session.commit()
-
-    # 기존 상품 stock이 None이면 기본값 채우기
-    try:
-        for prod in Product.query.filter(Product.stock.is_(None)).all():
-            prod.stock = 999 if "로블록스" not in (prod.title or "") else 5
-        db.session.commit()
-    except Exception as e:
-        print(f"[migrate] stock default fill skipped: {e}")
-        db.session.rollback()
-
-    # 로블록스 계정 상품 (없으면 추가)
-    roblox_products = [
-        ("로블록스 계정 [프리미엄]", "프리미엄 활성화 + 로벅스 약 5만 보유 계정입니다.\n안전한 계정 이전 방식으로 전달됩니다.", 45000, 5),
-        ("로블록스 계정 [고레벨]", "레벨 높고 아이템/아바타 꾸며진 계정입니다.\n로벅스 약 2~3만 포함.", 35000, 8),
-        ("로블록스 계정 [로벅스 10만]", "로벅스 10만 이상 보유 계정입니다.\n프리미엄 여부는 상품 설명 참고.", 89000, 3),
-        ("로블록스 계정 [입문용]", "저렴한 입문용 계정입니다.\n기본 아바타 + 소량 로벅스 포함.", 15000, 15),
+def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
+    result = code
+    opts = set(options or [])
+    header = [
+        f"-- Obfuscated by {APP_NAME} v{VERSION}",
+        f"-- intensity: {intensity} | options: {', '.join(sorted(opts)) if opts else 'none'}",
+        f"-- {datetime.utcnow().isoformat()}Z",
+        "",
     ]
-    for t, d, p, s in roblox_products:
-        existing = Product.query.filter_by(title=t).first()
-        if not existing:
-            db.session.add(Product(title=t, description=d, price=p, stock=s))
-        else:
-            if existing.stock is None:
-                existing.stock = s
-    db.session.commit()
 
-def get_user():
-    uid = session.get("user_id")
-    return User.query.get(uid) if uid else None
+    if intensity == "strong":
+        opts.update(["rename_vars", "encrypt_strings", "junk_code"])
+    elif intensity == "extreme":
+        opts.update(["rename_vars", "encrypt_strings", "cff", "dead_code", "junk_code", "number_encrypt", "opaque_predicates"])
 
-def login_required(f):
-    @wraps(f)
-    def deco(*a, **k):
-        if not session.get("user_id"):
-            flash("로그인이 필요합니다.", "error")
-            return redirect("/login")
-        return f(*a, **k)
-    return deco
+    if "minify" in opts:
+        lines = []
+        for line in result.splitlines():
+            s = line.strip()
+            if s.startswith("--") or not s:
+                continue
+            lines.append(s)
+        result = " ".join(lines)
 
-def admin_required(f):
-    @wraps(f)
-    def deco(*a, **k):
-        u = get_user()
-        if not u or not u.is_admin:
-            flash("관리자만 가능합니다.", "error")
-            return redirect("/")
-        return f(*a, **k)
-    return deco
+    if "rename_vars" in opts:
+        mapping = {}
+        def ren(m):
+            name = m.group(1)
+            if name not in mapping:
+                mapping[name] = _rand_ident(7)
+            return "local " + mapping[name]
+        result = re.sub(r"\blocal\s+([a-zA-Z_][a-zA-Z0-9_]*)", ren, result)
 
-def render(body):
-    u = get_user()
-    nav = ""
-    if u:
-        nav = f'''<a href="/my-courses" class="font-medium text-gray-700">내 강의</a>
-        <a href="/my-orders" class="text-gray-600">주문내역</a>'''
-        if u.is_admin:
-            nav += '<a href="/admin" class="text-red-600 font-medium">관리자</a>'
-        nav += '<a href="/logout" class="text-gray-500">로그아웃</a>'
-    else:
-        nav = '''<a href="/login" class="text-gray-600">로그인</a>
-        <a href="/signup" class="bg-indigo-600 text-white px-4 py-1.5 rounded-lg">회원가입</a>'''
+    if "encrypt_strings" in opts:
+        key = 0x5A
+        decryptor = _make_string_decryptor(key)
+        def str_enc(m):
+            content = m.group(2)
+            if len(content) < 1:
+                return m.group(0)
+            return f"_S('{_xor_string(content, key)}')"
+        result = re.sub(r"(['\"])(.*?)\1", str_enc, result)
+        result = decryptor + chr(10) + result
 
-    flashes = ""
-    for cat, msg in get_flashed_messages(with_categories=True):
-        cls = "bg-red-100 text-red-700" if cat == "error" else "bg-green-100 text-green-700"
-        flashes += f'<div class="mb-4 p-4 rounded-lg {cls}">{msg}</div>'
+    if "number_encrypt" in opts:
+        def num_enc(m):
+            n = int(m.group(0))
+            return _encrypt_number(n) if n > 9 else m.group(0)
+        result = re.sub(r"\b\d{2,}\b", num_enc, result)
 
-    # 실시간 AI 상담 봇 위젯 (플로팅)
-    chat_widget = '''
-<!-- AI 상담 봇 위젯 -->
-<div id="chat-widget" class="fixed bottom-5 right-5 z-[9999]" style="pointer-events:auto;">
-  <button type="button" id="chat-toggle" onclick="toggleChat()" 
-          class="bg-indigo-600 hover:bg-indigo-700 active:bg-indigo-800 text-white rounded-full w-14 h-14 shadow-xl flex items-center justify-center text-2xl transition cursor-pointer"
-          style="pointer-events:auto; -webkit-tap-highlight-color:transparent;">
-    💬
-  </button>
-  <div id="chat-box" class="hidden fixed bottom-20 right-5 w-[calc(100vw-2.5rem)] max-w-sm bg-white rounded-2xl shadow-2xl border border-gray-200 overflow-hidden flex flex-col z-[9999]" style="height:min(420px,70vh); pointer-events:auto;">
-    <div class="bg-indigo-600 text-white px-4 py-3 flex justify-between items-center flex-shrink-0">
-      <div>
-        <div class="font-semibold text-sm">다온 클래스 상담봇</div>
-        <div class="text-xs opacity-80">AI가 실시간으로 도와드려요</div>
-      </div>
-      <button type="button" onclick="toggleChat()" class="text-white/80 hover:text-white text-2xl leading-none px-1">&times;</button>
-    </div>
-    <div id="chat-messages" class="flex-1 overflow-y-auto p-4 space-y-3 bg-gray-50 text-sm">
-      <div class="flex justify-start">
-        <div class="bg-white border rounded-2xl rounded-tl-none px-3 py-2 max-w-[85%] shadow-sm">
-          안녕하세요! 다온 클래스입니다 😊<br>
-          강의 안내, 구매 방법, 입금 문의 등 무엇이든 물어보세요.
-        </div>
-      </div>
-    </div>
-    <div class="p-3 border-t bg-white flex-shrink-0">
-      <form id="chat-form" onsubmit="sendChat(event)" class="flex gap-2">
-        <input id="chat-input" type="text" placeholder="메시지를 입력하세요..." autocomplete="off"
-               class="flex-1 border rounded-full px-4 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-400">
-        <button type="submit" class="bg-indigo-600 text-white rounded-full px-4 py-2 text-sm hover:bg-indigo-700">전송</button>
-      </form>
-    </div>
+    if "dead_code" in opts:
+        dead_snippets = ["if false then local _d=1 end", "do local _x=nil end", "if 1>2 then return end"]
+        lines = result.splitlines() or [result]
+        for _ in range(min(5, max(2, len(lines)//3))):
+            lines.insert(random.randint(0, len(lines)), random.choice(dead_snippets))
+        result = chr(10).join(lines)
+
+    if "junk_code" in opts:
+        junk_snippets = [f"local {_rand_ident()}=math.random()", f"local {_rand_ident()}=os.clock()", f"local {_rand_ident()}={{}}"]
+        lines = result.splitlines() or [result]
+        for _ in range(min(4, max(2, len(lines)//4))):
+            lines.insert(random.randint(0, len(lines)), random.choice(junk_snippets))
+        result = chr(10).join(lines)
+
+    if "opaque_predicates" in opts:
+        result = result.replace("if ", "if (function() return true end)() and ", 1)
+
+    if "proxy_functions" in opts:
+        p = _rand_ident(6)
+        result = f"local {p}=function(f,...)return f(...)end" + chr(10) + result
+
+    if "anti_tamper" in opts:
+        result = "local _t0=os.clock()" + chr(10) + "if debug and debug.getinfo then local _=debug.getinfo(1) end" + chr(10) + result
+
+    if "cff" in opts:
+        result = "local _st=0" + chr(10) + "while true do" + chr(10) + "if _st==0 then" + chr(10) + result + chr(10) + "_st=1" + chr(10) + "elseif _st==1 then break end" + chr(10) + "end"
+
+    if intensity == "extreme" and ("cff" in opts or "encrypt_strings" in opts):
+        key = random.randint(0x30, 0x6F)
+        payload = _xor_string(result, key)
+        result = (
+            _make_string_decryptor(key) + chr(10)
+            + f"local _bc=_S('{payload}')" + chr(10)
+            + "local _fn,err=loadstring(_bc)" + chr(10)
+            + "if _fn then _fn() else error(err) end"
+        )
+
+    return chr(10).join(header) + result
+
+
+def calc_cost(intensity: str, options: List[str]) -> int:
+    cost = BASE_COST.get(intensity, 12)
+    for opt in options:
+        cost += OPTION_COST.get(opt, 0)
+    return cost
+
+# ======================
+# App
+# ======================
+
+app = FastAPI(title=APP_NAME, version=VERSION)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+def base_html(content: str, lang: str = "ko", user=None):
+    balance = user["credits"] if user else 0
+    username = user["username"] if user else ""
+    nav_user = ""
+    if user:
+        nav_user = f"""
+        <span class="muted" style="margin-left:16px">{username} · {balance} credits</span>
+        <a href="/logout" class="btn btn-outline" style="margin-left:12px">{t('logout', lang)}</a>
+        """
+    return f"""<!DOCTYPE html>
+<html lang="{lang}">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{APP_NAME}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:'Segoe UI',system-ui,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh}}
+.container{{max-width:980px;margin:0 auto;padding:24px}}
+header{{display:flex;justify-content:space-between;align-items:center;margin-bottom:28px;flex-wrap:wrap;gap:12px}}
+h1{{font-size:1.55rem;color:#a5b4fc}}
+.card{{background:#1e293b;border-radius:12px;padding:22px;margin-bottom:18px;border:1px solid #334155}}
+input,select,textarea{{width:100%;padding:11px;margin:7px 0 14px;border-radius:8px;border:1px solid #475569;background:#0f172a;color:#e2e8f0;font-size:14px}}
+textarea{{height:210px;font-family:monospace;resize:vertical}}
+button,.btn{{display:inline-block;padding:11px 18px;border-radius:8px;border:none;background:#6366f1;color:white;font-weight:600;cursor:pointer;text-decoration:none;font-size:14px}}
+button:hover,.btn:hover{{background:#4f46e5}}
+.btn-outline{{background:transparent;border:1px solid #6366f1}}
+.row{{display:flex;gap:12px;flex-wrap:wrap;align-items:center}}
+.muted{{color:#94a3b8;font-size:13px}}
+pre.result{{background:#020617;padding:16px;border-radius:8px;overflow-x:auto;white-space:pre-wrap;word-break:break-all;font-size:12.5px;border:1px solid #1e293b;max-height:430px;overflow-y:auto}}
+.success{{color:#4ade80}}
+.error{{color:#f87171}}
+label{{font-size:13px;color:#94a3b8}}
+.nav a{{margin-left:12px;color:#a5b4fc;text-decoration:none;font-size:14px}}
+.opts{{display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;margin:10px 0 16px}}
+.opts label{{display:flex;align-items:center;gap:8px;color:#e2e8f0;font-size:13px;cursor:pointer}}
+.opts input{{width:auto;margin:0}}
+@media(max-width:600px){{.opts{{grid-template-columns:1fr}}}}
+</style>
+</head>
+<body>
+<div class="container">
+<header>
+  <h1>{APP_NAME}</h1>
+  <div class="nav">
+    <a href="/?lang=ko">한국어</a>
+    <a href="/?lang=en">English</a>
+    {nav_user}
   </div>
+</header>
+{content}
 </div>
+</body>
+</html>"""
 
-<script>
-const chatHistory = [];
-let chatOpen = false;
+# ======================
+# Routes
+# ======================
 
-function toggleChat() {
-  const box = document.getElementById("chat-box");
-  if (!box) return;
-  chatOpen = !chatOpen;
-  if (chatOpen) {
-    box.classList.remove("hidden");
-    setTimeout(function(){ var el = document.getElementById("chat-input"); if(el) el.focus(); }, 50);
-  } else {
-    box.classList.add("hidden");
-  }
-}
-
-function addMessage(role, content) {
-  const container = document.getElementById("chat-messages");
-  if (!container) return;
-  const isUser = role === "user";
-  const div = document.createElement("div");
-  div.className = "flex " + (isUser ? "justify-end" : "justify-start");
-  var safe = (content || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/\\n/g,"<br>");
-  div.innerHTML = "<div class=\\"" + (isUser ? "bg-indigo-600 text-white rounded-2xl rounded-tr-none" : "bg-white border rounded-2xl rounded-tl-none shadow-sm") + " px-3 py-2 max-w-[85%]\\">" + safe + "</div>";
-  container.appendChild(div);
-  container.scrollTop = container.scrollHeight;
-}
-
-async function sendChat(e) {
-  e.preventDefault();
-  const input = document.getElementById("chat-input");
-  const msg = (input && input.value || "").trim();
-  if (!msg) return;
-  input.value = "";
-  addMessage("user", msg);
-  chatHistory.push({role: "user", content: msg});
-
-  const loadingId = "loading-" + Date.now();
-  const container = document.getElementById("chat-messages");
-  const loadingDiv = document.createElement("div");
-  loadingDiv.id = loadingId;
-  loadingDiv.className = "flex justify-start";
-  loadingDiv.innerHTML = "<div class=\\"bg-white border rounded-2xl rounded-tl-none px-3 py-2 text-gray-400 text-sm\\">답변 생성 중...</div>";
-  container.appendChild(loadingDiv);
-  container.scrollTop = container.scrollHeight;
-
-  try {
-    const res = await fetch("/api/chat", {
-      method: "POST",
-      headers: {"Content-Type": "application/json"},
-      credentials: "same-origin",
-      body: JSON.stringify({message: msg, history: chatHistory.slice(-10)})
-    });
-    const data = await res.json();
-    var ld = document.getElementById(loadingId);
-    if (ld) ld.remove();
-    if (data.reply) {
-      addMessage("assistant", data.reply);
-      chatHistory.push({role: "assistant", content: data.reply});
-    } else {
-      addMessage("assistant", data.error || "죄송합니다. 잠시 후 다시 시도해 주세요.");
-    }
-  } catch (err) {
-    var ld2 = document.getElementById(loadingId);
-    if (ld2) ld2.remove();
-    addMessage("assistant", "네트워크 오류가 발생했습니다. 잠시 후 다시 시도해 주세요.");
-  }
-}
-</script>
-'''
-
-
-    return f'''<!DOCTYPE html>
-<html lang="ko"><head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>다온 클래스</title>
-<script src="https://cdn.tailwindcss.com"></script>
-</head><body class="bg-gray-50 min-h-screen">
-<nav class="bg-white border-b shadow-sm">
-<div class="max-w-5xl mx-auto px-4 py-3 flex justify-between items-center">
-<a href="/" class="text-xl font-bold text-indigo-600">다온 클래스</a>
-<div class="flex gap-4 text-sm items-center">{nav}</div>
-</div></nav>
-<main class="max-w-5xl mx-auto px-4 py-8">
-{flashes}
-{body}
-</main>
-<footer class="border-t mt-12 py-6 text-center text-gray-400 text-sm">© 2026 다온 클래스 · <a href="https://daonshop.cloud" class="underline">daonshop.cloud</a></footer>
-{chat_widget}
-</body></html>'''
-
-
-# ==================== 메인 페이지 라우트 ====================
-
-@app.route("/")
-def index():
-    # 강의 상품만 표시 (로블록스 계정 제외)
-    products = Product.query.filter_by(is_active=True).filter(~Product.title.like("%로블록스%")).all()
-    cards = ""
-    for p in products:
-        cards += f'''<div class="bg-white rounded-xl border p-6">
-        <h2 class="text-xl font-semibold mb-2">{p.title}</h2>
-        <p class="text-gray-600 text-sm mb-4">{(p.description or "")[:80]}...</p>
-        <div class="flex justify-between items-center">
-        <span class="text-indigo-600 font-bold text-lg">{p.price:,}원</span>
-        <a href="/product/{p.id}" class="bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm">상세보기</a>
-        </div></div>'''
-    if not cards:
-        cards = '<p class="text-gray-500">등록된 강의가 없습니다.</p>'
-    return render(f'<h1 class="text-3xl font-bold mb-8">강의 목록</h1><div class="grid md:grid-cols-2 gap-6">{cards}</div>')
-
-
-@app.route("/roblox")
-def roblox_index():
-    """로블록스 계정 구매 페이지"""
-    products = Product.query.filter_by(is_active=True).filter(Product.title.like("%로블록스%")).all()
-    cards = ""
-    for p in products:
-        stock = p.stock if p.stock is not None else 0
-        if stock <= 0:
-            stock_badge = '<span class="text-xs bg-red-100 text-red-600 px-2 py-0.5 rounded-full">품절</span>'
-            btn = '<span class="bg-gray-300 text-gray-500 px-4 py-2 rounded-lg text-sm cursor-not-allowed">품절</span>'
-        else:
-            stock_badge = f'<span class="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full">재고 {stock}개</span>'
-            btn = f'<a href="/product/{p.id}" class="bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm hover:bg-indigo-700">상세보기</a>'
-        cards += f'''<div class="bg-white rounded-xl border p-6 hover:shadow-md transition">
-        <div class="flex items-center gap-2 mb-2">
-            <span class="text-2xl">🎮</span>
-            <h2 class="text-xl font-semibold">{p.title}</h2>
-            {stock_badge}
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request, lang: str = "ko"):
+    user = get_current_user(request)
+    if user:
+        return RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
+    content = f"""
+    <div class="card">
+        <h2>{t('welcome', lang)}</h2>
+        <p class="muted" style="margin:12px 0 24px">Luau / Lua Obfuscator + Credit System</p>
+        <div class="row">
+            <a class="btn" href="/register?lang={lang}">{t('register', lang)}</a>
+            <a class="btn btn-outline" href="/login?lang={lang}">{t('login', lang)}</a>
         </div>
-        <p class="text-gray-600 text-sm mb-4 whitespace-pre-line">{(p.description or "")[:120]}{"..." if len(p.description or "") > 120 else ""}</p>
-        <div class="flex justify-between items-center">
-        <span class="text-indigo-600 font-bold text-lg">{p.price:,}원</span>
-        {btn}
-        </div></div>'''
-    if not cards:
-        cards = '<p class="text-gray-500">현재 판매 중인 로블록스 계정이 없습니다.</p>'
-    body = f'''
-    <div class="mb-8">
-        <h1 class="text-3xl font-bold mb-2">🎮 로블록스 계정 구매</h1>
-        <p class="text-gray-600">안전하고 빠른 계정 이전 · 입금 확인 후 즉시 전달</p>
-    </div>
-    <div class="bg-indigo-50 border border-indigo-100 rounded-xl p-4 mb-8 text-sm text-indigo-800">
-        <strong>구매 안내</strong><br>
-        1. 원하는 계정을 선택하고 구매하기<br>
-        2. 카카오뱅크 <strong>7777-03-0806539</strong> (예금주: 김시우) 로 입금<br>
-        3. 관리자 확인(결제완료 처리) 후 계정 정보 전달
-    </div>
-    <div class="grid md:grid-cols-2 gap-6">{cards}</div>
-    '''
-    return render(body)
+    </div>"""
+    return base_html(content, lang)
 
+@app.get("/register", response_class=HTMLResponse)
+async def register_page(lang: str = "ko"):
+    content = f"""
+    <div class="card">
+        <h2>{t('register', lang)}</h2>
+        <form method="post" action="/register">
+            <input type="hidden" name="lang" value="{lang}">
+            <label>{t('username', lang)}</label>
+            <input name="username" required minlength="3" maxlength="32" pattern="[a-zA-Z0-9_]+">
+            <label>{t('password', lang)}</label>
+            <input type="password" name="password" required minlength="4">
+            <button type="submit">{t('register', lang)}</button>
+        </form>
+        <p class="muted" style="margin-top:16px"><a href="/login?lang={lang}" style="color:#a5b4fc">{t('login', lang)}</a></p>
+    </div>"""
+    return base_html(content, lang)
 
-@app.route("/product/<int:pid>")
-def product_detail(pid):
-    p = Product.query.get_or_404(pid)
-    u = get_user()
-    stock = p.stock if p.stock is not None else 0
-    is_roblox = "로블록스" in (p.title or "")
-    back_link = ""
-    if is_roblox:
-        back_link = '<a href="/roblox" class="text-sm text-indigo-600 mb-4 inline-block">← 로블록스 계정 목록으로</a>'
-    stock_html = ""
-    if is_roblox:
-        if stock <= 0:
-            stock_html = '<p class="text-red-600 font-medium mb-4">현재 품절입니다.</p>'
-        else:
-            stock_html = f'<p class="text-green-600 text-sm mb-4">재고: {stock}개</p>'
-    if stock <= 0 and is_roblox:
-        btn = '<span class="inline-block bg-gray-300 text-gray-500 px-8 py-3 rounded-lg cursor-not-allowed">품절</span>'
-    elif u:
-        btn = f'<a href="/order/{p.id}" class="inline-block bg-indigo-600 text-white px-8 py-3 rounded-lg">구매하기</a>'
+@app.post("/register")
+async def register(username: str = Form(...), password: str = Form(...), lang: str = Form("ko")):
+    username = username.strip().lower()
+    if username in users_db:
+        content = f"""<div class="card"><p class="error">{t('already_exists', lang)}</p>
+        <a class="btn" href="/register?lang={lang}">{t('register', lang)}</a></div>"""
+        return HTMLResponse(base_html(content, lang))
+    users_db[username] = {
+        "username": username,
+        "password": hash_password(password),
+        "credits": 40,
+        "lang": lang,
+        "results": {},
+        "created_at": datetime.utcnow().isoformat(),
+    }
+    token = create_token()
+    sessions[token] = username
+    resp = RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
+    resp.set_cookie("session", token, httponly=True, max_age=60*60*24*30)
+    return resp
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(lang: str = "ko"):
+    content = f"""
+    <div class="card">
+        <h2>{t('login', lang)}</h2>
+        <form method="post" action="/login">
+            <input type="hidden" name="lang" value="{lang}">
+            <label>{t('username', lang)}</label>
+            <input name="username" required>
+            <label>{t('password', lang)}</label>
+            <input type="password" name="password" required>
+            <button type="submit">{t('login', lang)}</button>
+        </form>
+        <p class="muted" style="margin-top:16px"><a href="/register?lang={lang}" style="color:#a5b4fc">{t('register', lang)}</a></p>
+    </div>"""
+    return base_html(content, lang)
+
+@app.post("/login")
+async def login(username: str = Form(...), password: str = Form(...), lang: str = Form("ko")):
+    username = username.strip().lower()
+    user = users_db.get(username)
+    if not user or user["password"] != hash_password(password):
+        content = f"""<div class="card"><p class="error">{t('invalid_login', lang)}</p>
+        <a class="btn" href="/login?lang={lang}">{t('login', lang)}</a></div>"""
+        return HTMLResponse(base_html(content, lang))
+    token = create_token()
+    sessions[token] = username
+    resp = RedirectResponse(f"/dashboard?lang={lang}", status_code=302)
+    resp.set_cookie("session", token, httponly=True, max_age=60*60*24*30)
+    return resp
+
+@app.get("/logout")
+async def logout(request: Request):
+    token = request.cookies.get("session")
+    if token in sessions:
+        del sessions[token]
+    resp = RedirectResponse("/", status_code=302)
+    resp.delete_cookie("session")
+    return resp
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard(request: Request, lang: str = "ko", result_id: str = None, error: str = None):
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse(f"/login?lang={lang}", status_code=302)
+
+    result_block = ""
+    if error:
+        result_block = f"""<div class="card"><p class="error">{html_lib.escape(error)}</p></div>"""
+    elif result_id and result_id in user.get("results", {}):
+        safe = html_lib.escape(user["results"][result_id])
+        result_block = f"""
+        <div class="card">
+            <h3 class="success">{t('obfuscate_success', lang)}</h3>
+            <p class="muted">{t('result', lang)}</p>
+            <pre class="result" id="obfResult">{safe}</pre>
+            <button onclick="navigator.clipboard.writeText(document.getElementById('obfResult').innerText)">{t('copy', lang)}</button>
+        </div>"""
+
+    content = f"""
+    <div class="card">
+        <h2>{t('dashboard', lang)}</h2>
+        <p style="font-size:1.25rem;margin:10px 0">{t('balance', lang)}: <strong>{user['credits']}</strong></p>
+    </div>
+    {result_block}
+    <div class="card">
+        <h3>{t('obfuscate', lang)}</h3>
+        <form method="post" action="/obfuscate">
+            <input type="hidden" name="lang" value="{lang}">
+            <label>{t('intensity', lang)}</label>
+            <select name="intensity">
+                <option value="basic">{t('basic', lang)} (5+)</option>
+                <option value="strong" selected>{t('strong', lang)} (12+)</option>
+                <option value="extreme">{t('extreme', lang)} (25+)</option>
+            </select>
+
+            <label>{t('options', lang)}</label>
+            <div class="opts">
+                <label><input type="checkbox" name="options" value="rename_vars" checked> {t('opt_rename', lang)} (+3)</label>
+                <label><input type="checkbox" name="options" value="encrypt_strings" checked> {t('opt_strings', lang)} (+5)</label>
+                <label><input type="checkbox" name="options" value="cff"> {t('opt_cff', lang)} (+8)</label>
+                <label><input type="checkbox" name="options" value="dead_code"> {t('opt_dead', lang)} (+4)</label>
+                <label><input type="checkbox" name="options" value="junk_code"> {t('opt_junk', lang)} (+3)</label>
+                <label><input type="checkbox" name="options" value="anti_tamper"> {t('opt_tamper', lang)} (+6)</label>
+                <label><input type="checkbox" name="options" value="minify"> {t('opt_minify', lang)} (+2)</label>
+                <label><input type="checkbox" name="options" value="opaque_predicates"> {t('opt_opaque', lang)} (+5)</label>
+                <label><input type="checkbox" name="options" value="proxy_functions"> {t('opt_proxy', lang)} (+4)</label>
+                <label><input type="checkbox" name="options" value="number_encrypt"> {t('opt_numbers', lang)} (+3)</label>
+            </div>
+
+            <label>Code</label>
+            <textarea name="code" required placeholder="{t('code_placeholder', lang)}"></textarea>
+            <button type="submit">{t('submit', lang)}</button>
+        </form>
+    </div>
+    <div class="card">
+        <h3>{t('charge', lang)}</h3>
+        <form method="post" action="/charge">
+            <input type="hidden" name="lang" value="{lang}">
+            <label>Method</label>
+            <select name="method">
+                <option value="bank">{t('bank_transfer', lang)} (카카오뱅크)</option>
+                <option value="crypto">{t('crypto', lang)} (USDT)</option>
+            </select>
+            <label>{t('select_amount', lang)}</label>
+            <input type="number" name="amount" value="10000" min="1000" step="1000">
+            <button type="submit">{t('charge', lang)}</button>
+        </form>
+    </div>"""
+    return base_html(content, lang, user)
+
+@app.post("/obfuscate")
+async def do_obfuscate(request: Request, code: str = Form(...), intensity: str = Form("strong"), lang: str = Form("ko")):
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse(f"/login?lang={lang}", status_code=302)
+
+    form = await request.form()
+    options = form.getlist("options")
+
+    cost = calc_cost(intensity, options)
+    if user["credits"] < cost:
+        return RedirectResponse(
+            f"/dashboard?lang={lang}&error={t('insufficient_credit', lang)} (need {cost})",
+            status_code=302
+        )
+
+    user["credits"] -= cost
+    result = obfuscate_code(code, intensity, options)
+
+    result_id = str(uuid.uuid4())[:8]
+    if "results" not in user:
+        user["results"] = {}
+    user["results"][result_id] = result
+
+    return RedirectResponse(f"/dashboard?lang={lang}&result_id={result_id}", status_code=302)
+
+@app.post("/charge")
+async def create_charge(request: Request, amount: float = Form(...), method: str = Form(...), lang: str = Form("ko")):
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse(f"/login?lang={lang}", status_code=302)
+
+    payment_id = str(uuid.uuid4())[:8]
+    credits = calc_credits(amount, method)
+    pending_payments[payment_id] = {
+        "payment_id": payment_id,
+        "username": user["username"],
+        "method": method,
+        "amount": amount,
+        "credits": credits,
+        "status": "pending",
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    if method == "bank":
+        body = f"""
+        <div class="card">
+            <h3>{t('bank_transfer', lang)}</h3>
+            <p><strong>{BANK_INFO['bank']}</strong></p>
+            <p style="font-size:1.4rem;letter-spacing:1px">{BANK_INFO['account']}</p>
+            <p>예금주: {BANK_INFO['holder']}</p>
+            <p class="muted">금액: {amount:,.0f}원 → {credits} 크레딧</p>
+            <p class="muted">Payment ID: <code>{payment_id}</code></p>
+            <hr style="border-color:#334155;margin:20px 0">
+            <p>{t('after_transfer', lang)}</p>
+            <form method="post" action="/confirm-payment">
+                <input type="hidden" name="lang" value="{lang}">
+                <input type="hidden" name="payment_id" value="{payment_id}">
+                <label>{t('depositor_name', lang)}</label>
+                <input name="depositor_name" required placeholder="입금자명">
+                <button type="submit">{t('confirm_payment', lang)}</button>
+            </form>
+            <p style="margin-top:16px"><a href="/dashboard?lang={lang}" class="btn btn-outline">← Dashboard</a></p>
+        </div>"""
     else:
-        btn = '<a href="/login" class="inline-block bg-indigo-600 text-white px-8 py-3 rounded-lg">로그인 후 구매하기</a>'
-    return render(f'''{back_link}
-    <div class="bg-white rounded-xl border p-8">
-    <h1 class="text-3xl font-bold mb-4">{p.title}</h1>
-    <p class="text-2xl text-indigo-600 font-bold mb-2">{p.price:,}원</p>
-    {stock_html}
-    <div class="text-gray-700 whitespace-pre-line mb-8">{p.description or ""}</div>
-    {btn}</div>''')
+        body = f"""
+        <div class="card">
+            <h3>{t('crypto', lang)}</h3>
+            <p>{CRYPTO_INFO['currency']} ({CRYPTO_INFO['network']})</p>
+            <p style="font-size:1.1rem;word-break:break-all">{CRYPTO_INFO['address']}</p>
+            <p class="muted">Amount: {amount} {CRYPTO_INFO['currency']} → {credits} credits</p>
+            <p class="muted">Payment ID: <code>{payment_id}</code></p>
+            <hr style="border-color:#334155;margin:20px 0">
+            <p>{t('after_transfer', lang)}</p>
+            <form method="post" action="/confirm-payment">
+                <input type="hidden" name="lang" value="{lang}">
+                <input type="hidden" name="payment_id" value="{payment_id}">
+                <label>{t('tx_hash', lang)}</label>
+                <input name="tx_hash" required placeholder="Transaction Hash">
+                <button type="submit">{t('confirm_payment', lang)}</button>
+            </form>
+            <p style="margin-top:16px"><a href="/dashboard?lang={lang}" class="btn btn-outline">← Dashboard</a></p>
+        </div>"""
+    return HTMLResponse(base_html(body, lang, user))
+
+@app.post("/confirm-payment")
+async def confirm_payment(
+    request: Request,
+    payment_id: str = Form(...),
+    depositor_name: str = Form(None),
+    tx_hash: str = Form(None),
+    lang: str = Form("ko")
+):
+    user = get_current_user(request)
+    if not user:
+        return RedirectResponse(f"/login?lang={lang}", status_code=302)
+
+    payment = pending_payments.get(payment_id)
+    if not payment or payment["username"] != user["username"]:
+        return RedirectResponse(f"/dashboard?lang={lang}&error=Payment not found", status_code=302)
+
+    if payment["status"] == "pending":
+        payment["status"] = "pending"  # stays pending until admin approves
+        payment["depositor_name"] = depositor_name
+        payment["tx_hash"] = tx_hash
+        payment["submitted_at"] = datetime.utcnow().isoformat()
+        # credits added only after /admin approve
+
+    msg = {
+        "ko": "입금 확인 요청이 접수되었습니다. 관리자 승인 후 크레딧이 지급됩니다.",
+        "en": "Payment proof submitted. Credits will be added after admin approval."
+    }.get(lang, "Submitted. Waiting for admin approval.")
+
+    content = f"""
+    <div class="card">
+        <h3 class="success">{msg}</h3>
+        <p>Payment ID: <code>{payment_id}</code></p>
+        <p>{t('balance', lang)}: {user['credits']} (pending +{payment['credits']})</p>
+        <a class="btn" href="/dashboard?lang={lang}">Dashboard</a>
+    </div>"""
+    return HTMLResponse(base_html(content, lang, user))
 
 
-@app.route("/signup", methods=["GET","POST"])
-def signup():
-    if get_user(): return redirect("/")
-    if request.method == "POST":
-        username = request.form.get("username","").strip()
-        password = request.form.get("password","")
-        email = request.form.get("email","").strip()
-        if not username or not password:
-            flash("아이디와 비밀번호를 입력하세요.","error")
-        elif User.query.filter_by(username=username).first():
-            flash("이미 존재하는 아이디입니다.","error")
-        else:
-            user = User(username=username, email=email)
-            user.set_password(password)
-            db.session.add(user); db.session.commit()
-            session["user_id"] = user.id
-            flash("회원가입 완료!","success")
-            return redirect("/")
-    return render('''<div class="max-w-md mx-auto bg-white rounded-xl border p-8">
-    <h1 class="text-2xl font-bold mb-6 text-center">회원가입</h1>
-    <form method="post" class="space-y-4">
-    <input name="username" placeholder="아이디" required class="w-full border rounded-lg px-4 py-2">
-    <input name="email" type="email" placeholder="이메일 (선택)" class="w-full border rounded-lg px-4 py-2">
-    <input name="password" type="password" placeholder="비밀번호" required class="w-full border rounded-lg px-4 py-2">
-    <button class="w-full bg-indigo-600 text-white py-3 rounded-lg">가입하기</button>
-    </form>
-    <p class="text-center mt-4 text-sm">이미 계정이 있으신가요? <a href="/login" class="text-indigo-600">로그인</a></p>
-    </div>''')
+
+# ======================
+# Admin
+# ======================
+
+def get_admin(request: Request):
+    token = request.cookies.get("admin_session")
+    if token and token in admin_sessions:
+        return True
+    return False
 
 
-@app.route("/login", methods=["GET","POST"])
-def login():
-    if get_user(): return redirect("/")
-    if request.method == "POST":
-        username = request.form.get("username","").strip()
-        password = request.form.get("password","")
-        user = User.query.filter_by(username=username).first()
-        if user and user.check_password(password):
-            session["user_id"] = user.id
-            flash(f"{user.username}님 환영합니다!","success")
-            return redirect("/")
-        flash("아이디 또는 비밀번호가 틀렸습니다.","error")
-    return render('''<div class="max-w-md mx-auto bg-white rounded-xl border p-8">
-    <h1 class="text-2xl font-bold mb-6 text-center">로그인</h1>
-    <form method="post" class="space-y-4">
-    <input name="username" placeholder="아이디" required class="w-full border rounded-lg px-4 py-2">
-    <input name="password" type="password" placeholder="비밀번호" required class="w-full border rounded-lg px-4 py-2">
-    <button class="w-full bg-indigo-600 text-white py-3 rounded-lg">로그인</button>
-    </form>
-    <p class="text-center mt-4 text-sm">계정이 없으신가요? <a href="/signup" class="text-indigo-600">회원가입</a></p>
-    </div>''')
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(request: Request, lang: str = "ko"):
+    if not get_admin(request):
+        content = f"""
+        <div class="card">
+            <h2>Admin Login</h2>
+            <form method="post" action="/admin/login">
+                <input type="hidden" name="lang" value="{lang}">
+                <label>Username</label>
+                <input name="username" required>
+                <label>Password</label>
+                <input type="password" name="password" required>
+                <button type="submit">Login</button>
+            </form>
+        </div>"""
+        return base_html(content, lang)
 
+    # list pending + recent
+    pending = [p for p in pending_payments.values() if p.get("status") == "pending"]
+    completed = [p for p in pending_payments.values() if p.get("status") == "completed"]
+    completed = sorted(completed, key=lambda x: x.get("created_at", ""), reverse=True)[:20]
 
-@app.route("/logout")
-def logout():
-    session.pop("user_id", None)
-    flash("로그아웃되었습니다.","success")
-    return redirect("/")
-
-
-@app.route("/order/<int:pid>")
-@login_required
-def create_order(pid):
-    p = Product.query.get_or_404(pid)
-    u = get_user()
-    stock = p.stock if p.stock is not None else 0
-    is_roblox = "로블록스" in (p.title or "")
-    if is_roblox and stock <= 0:
-        flash("현재 품절된 상품입니다.", "error")
-        return redirect("/roblox")
-    if Order.query.filter_by(user_id=u.id, product_id=p.id, status="paid").first():
-        flash("이미 구매한 상품입니다.","success")
-        return redirect("/my-courses")
-    order = Order.query.filter_by(user_id=u.id, product_id=p.id, status="pending").first()
-    if not order:
-        order = Order(order_id=f"DAON-{datetime.now().strftime('%Y%m%d')}-{secrets.token_hex(4).upper()}",
-                      user_id=u.id, product_id=p.id, amount=p.price)
-        db.session.add(order); db.session.commit()
-    item_label = "상품" if is_roblox else "강의"
-    after_msg = "확인 후 계정 정보를 전달해 드립니다." if is_roblox else "확인 후 <strong>내 강의</strong>에서 PDF를 받을 수 있습니다."
-    return render(f'''<div class="max-w-lg mx-auto bg-white rounded-xl border p-8">
-    <div class="text-center mb-6"><div class="text-5xl mb-3">🏦</div><h1 class="text-2xl font-bold">입금 안내</h1></div>
-    <div class="bg-indigo-50 rounded-lg p-5 mb-6 space-y-3">
-    <div class="flex justify-between"><span class="text-gray-600">{item_label}</span><span class="font-medium">{p.title}</span></div>
-    <div class="flex justify-between"><span class="text-gray-600">입금 금액</span><span class="font-bold text-indigo-600 text-lg">{order.amount:,}원</span></div>
-    <hr>
-    <div class="flex justify-between"><span class="text-gray-600">은행</span><span class="font-medium">{BANK_NAME}</span></div>
-    <div class="flex justify-between"><span class="text-gray-600">계좌번호</span><span class="font-mono font-bold text-lg">{BANK_ACCOUNT}</span></div>
-    <div class="flex justify-between"><span class="text-gray-600">예금주</span><span class="font-medium">{BANK_HOLDER}</span></div>
-    </div>
-    <div class="bg-yellow-50 border border-yellow-200 rounded-lg p-4 text-sm text-yellow-800 mb-6">
-    금액을 정확히 입금해 주세요. {after_msg}
-    </div>
-    <div class="text-center"><a href="/my-orders" class="text-indigo-600">주문 내역 보기</a>
-    <p class="text-xs text-gray-400 mt-2">주문번호: {order.order_id}</p></div></div>''')
-
-
-@app.route("/my-orders")
-@login_required
-def my_orders():
-    orders = Order.query.filter_by(user_id=session["user_id"]).order_by(Order.created_at.desc()).all()
     rows = ""
-    for o in orders:
-        st = "결제 완료" if o.status=="paid" else "입금 대기"
-        cls = "bg-green-100 text-green-700" if o.status=="paid" else "bg-yellow-100 text-yellow-700"
-        rows += f'''<div class="bg-white rounded-xl border p-5 flex justify-between items-center">
-        <div><h3 class="font-semibold">{o.product.title}</h3>
-        <p class="text-sm text-gray-500">{o.created_at.strftime("%Y-%m-%d %H:%M") if o.created_at else ""} · {o.amount:,}원</p></div>
-        <span class="px-3 py-1 rounded-full text-sm {cls}">{st}</span></div>'''
-    if not rows: rows = '<p class="text-gray-500">주문 내역이 없습니다.</p>'
-    return render(f'<h1 class="text-2xl font-bold mb-6">내 주문 내역</h1><div class="space-y-4">{rows}</div>')
+    if not pending:
+        rows = "<p class='muted'>대기 중인 결제가 없습니다.</p>"
+    else:
+        for p in pending:
+            dep = p.get("depositor_name") or p.get("tx_hash") or "-"
+            rows += f"""
+            <div style="border:1px solid #334155;border-radius:8px;padding:12px;margin-bottom:10px">
+                <p><strong>ID:</strong> {p['payment_id']} | <strong>User:</strong> {p['username']}</p>
+                <p><strong>Method:</strong> {p['method']} | <strong>Amount:</strong> {p['amount']} → <strong>{p['credits']} credits</strong></p>
+                <p><strong>Depositor / Tx:</strong> {dep}</p>
+                <p class="muted">{p.get('created_at','')}</p>
+                <form method="post" action="/admin/approve" style="display:inline">
+                    <input type="hidden" name="payment_id" value="{p['payment_id']}">
+                    <input type="hidden" name="lang" value="{lang}">
+                    <button type="submit">승인 (크레딧 지급)</button>
+                </form>
+                <form method="post" action="/admin/reject" style="display:inline;margin-left:8px">
+                    <input type="hidden" name="payment_id" value="{p['payment_id']}">
+                    <input type="hidden" name="lang" value="{lang}">
+                    <button type="submit" class="btn-outline" style="background:#7f1d1d;border-color:#7f1d1d">거절</button>
+                </form>
+            </div>"""
+
+    done_rows = ""
+    for p in completed:
+        done_rows += f"<p class='muted'>{p['payment_id']} · {p['username']} · {p['credits']}cr · {p.get('created_at','')}</p>"
+
+    content = f"""
+    <div class="card">
+        <h2>Admin Dashboard</h2>
+        <p class="muted">대기 결제 승인 / 거절</p>
+        <p><a href="/admin/logout" class="btn btn-outline">Admin Logout</a></p>
+    </div>
+    <div class="card">
+        <h3>Pending ({len(pending)})</h3>
+        {rows}
+    </div>
+    <div class="card">
+        <h3>Recent Completed</h3>
+        {done_rows or "<p class='muted'>없음</p>"}
+    </div>"""
+    return base_html(content, lang)
 
 
-@app.route("/my-courses")
-@login_required
-def my_courses():
-    orders = Order.query.filter_by(user_id=session["user_id"], status="paid").all()
-    rows = ""
-    for o in orders:
-        is_roblox = "로블록스" in (o.product.title or "")
-        if o.product.pdf_filename:
-            btn = f'<a href="/download/{o.id}" class="bg-indigo-600 text-white px-5 py-2.5 rounded-lg text-sm">PDF 다운로드</a>'
-            extra = ""
-        elif is_roblox:
-            if o.delivered_account:
-                safe_acc = (o.delivered_account or "").replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-                btn = ""
-                extra = f'''<div class="mt-3 w-full bg-gray-50 border rounded-lg p-3 text-sm">
-                <div class="font-medium text-green-700 mb-1">지급된 계정 정보</div>
-                <pre class="whitespace-pre-wrap break-all font-mono text-gray-800">{safe_acc}</pre>
-                </div>'''
-            else:
-                btn = '<span class="text-sm text-yellow-600 font-medium">계정 준비 중 (관리자 확인 후 자동 지급)</span>'
-                extra = ""
-        else:
-            btn = '<span class="text-sm text-gray-400">PDF 준비 중</span>'
-            extra = ""
-        rows += f'''<div class="bg-white rounded-xl border p-5">
-        <div class="flex justify-between items-center">
-        <div><h3 class="font-semibold text-lg">{o.product.title}</h3></div>{btn}</div>{extra}</div>'''
-    if not rows: rows = '<p class="text-gray-500">아직 구매한 상품이 없습니다. <a href="/" class="text-indigo-600">강의 보러가기</a> · <a href="/roblox" class="text-indigo-600">로블록스 계정</a></p>'
-    return render(f'<h1 class="text-2xl font-bold mb-6">내 강의 / 구매 상품</h1><div class="space-y-4">{rows}</div>')
+@app.post("/admin/login")
+async def admin_login(username: str = Form(...), password: str = Form(...), lang: str = Form("ko")):
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        token = create_token()
+        admin_sessions.add(token)
+        resp = RedirectResponse(f"/admin?lang={lang}", status_code=302)
+        resp.set_cookie("admin_session", token, httponly=True, max_age=60*60*12)
+        return resp
+    content = f"""
+    <div class="card">
+        <p class="error">Invalid admin credentials</p>
+        <a class="btn" href="/admin?lang={lang}">Back</a>
+    </div>"""
+    return HTMLResponse(base_html(content, lang))
 
 
-@app.route("/download/<int:oid>")
-@login_required
-def download(oid):
-    order = Order.query.get_or_404(oid)
-    if order.user_id != session["user_id"] or order.status != "paid": abort(403)
-    if not order.product.pdf_filename:
-        flash("PDF가 아직 없습니다.","error"); return redirect("/my-courses")
-    path = os.path.join("uploads", order.product.pdf_filename)
-    if not os.path.exists(path):
-        flash("파일을 찾을 수 없습니다.","error"); return redirect("/my-courses")
-    return send_file(path, as_attachment=True)
+@app.get("/admin/logout")
+async def admin_logout(request: Request):
+    token = request.cookies.get("admin_session")
+    if token in admin_sessions:
+        admin_sessions.discard(token)
+    resp = RedirectResponse("/admin", status_code=302)
+    resp.delete_cookie("admin_session")
+    return resp
 
 
-@app.route("/admin")
-@admin_required
-def admin():
-    orders = Order.query.order_by(Order.created_at.desc()).all()
-    products = Product.query.all()
-    order_rows = ""
-    for o in orders:
-        st = "결제완료" if o.status=="paid" else "입금대기"
-        cls = "text-green-600" if o.status=="paid" else "text-yellow-600"
-        btn = f'<a href="/admin/pay/{o.id}" class="bg-green-600 text-white px-3 py-1 rounded text-sm">결제완료 처리</a>' if o.status=="pending" else ""
-        order_rows += f'''<div class="bg-white rounded-xl border p-4 flex justify-between items-center">
-        <div>{o.user.username} - {o.product.title} ({o.amount:,}원)</div>
-        <div class="flex gap-2 items-center"><span class="text-sm {cls}">{st}</span>{btn}</div></div>'''
-    prod_rows = ""
-    for p in products:
-        pdf = '<span class="text-green-600 text-xs">PDF</span>' if p.pdf_filename else ""
-        stock = p.stock if p.stock is not None else 0
-        stock_cls = "text-red-600" if stock <= 0 else "text-gray-600"
-        prod_rows += f'''<div class="bg-white rounded-xl border p-4 flex justify-between items-center">
-        <span>{p.title} - {p.price:,}원 {pdf} <span class="text-xs {stock_cls}">(재고 {stock})</span></span>
-        <div class="flex gap-3">
-        <a href="/admin/product/{p.id}" class="text-indigo-600 text-sm">수정</a>
-        <a href="/admin/product/delete/{p.id}" class="text-red-600 text-sm" onclick="return confirm('정말 삭제하시겠습니까?')">삭제</a>
-        </div></div>'''
-    return render(f'''<h1 class="text-2xl font-bold mb-6">관리자</h1>
-    <h2 class="font-semibold mb-3">주문 관리 (구매 승인)</h2>
-    <div class="space-y-3 mb-10">{order_rows or '<p class="text-gray-500">주문이 없습니다.</p>'}</div>
-    <h2 class="font-semibold mb-3">상품 관리 (재고 수정 가능)</h2>
-    <a href="/admin/product/new" class="inline-block mb-4 bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm">+ 상품 추가</a>
-    <div class="space-y-3">{prod_rows}</div>''')
+@app.post("/admin/approve")
+async def admin_approve(request: Request, payment_id: str = Form(...), lang: str = Form("ko")):
+    if not get_admin(request):
+        return RedirectResponse("/admin", status_code=302)
+
+    payment = pending_payments.get(payment_id)
+    if not payment:
+        return RedirectResponse(f"/admin?lang={lang}", status_code=302)
+
+    if payment["status"] == "pending":
+        payment["status"] = "completed"
+        payment["approved_at"] = datetime.utcnow().isoformat()
+        payment["approved_by"] = "admin"
+        username = payment["username"]
+        if username in users_db:
+            users_db[username]["credits"] += payment["credits"]
+
+    return RedirectResponse(f"/admin?lang={lang}", status_code=302)
 
 
-@app.route("/admin/pay/<int:oid>")
-@admin_required
-def admin_pay(oid):
-    order = Order.query.get_or_404(oid)
-    if order.status == "pending":
-        order.status = "paid"
-        order.paid_at = datetime.utcnow()
-        product = order.product
-        # 재고 차감
-        if product and product.stock is not None and product.stock > 0:
-            product.stock -= 1
-        # 로블록스: GitHub raw에서 계정 1개 지급
-        if product and "로블록스" in (product.title or ""):
-            assigned = assign_accounts_from_url(product, count=1)
-            if assigned:
-                order.delivered_account = assigned
-                flash("결제완료 처리 + 계정 지급 완료", "success")
-            else:
-                flash("결제완료 처리됨. (계정 목록 URL이 없거나 재고 계정이 부족합니다. 관리자에서 URL/목록 확인)", "error")
-        else:
-            flash("결제완료 처리했습니다. (재고 반영됨)", "success")
-        db.session.commit()
-    return redirect("/admin")
+@app.post("/admin/reject")
+async def admin_reject(request: Request, payment_id: str = Form(...), lang: str = Form("ko")):
+    if not get_admin(request):
+        return RedirectResponse("/admin", status_code=302)
+
+    payment = pending_payments.get(payment_id)
+    if payment and payment["status"] == "pending":
+        payment["status"] = "rejected"
+        payment["rejected_at"] = datetime.utcnow().isoformat()
+
+    return RedirectResponse(f"/admin?lang={lang}", status_code=302)
 
 
-@app.route("/admin/product/delete/<int:pid>")
-@admin_required
-def admin_product_delete(pid):
-    product = Product.query.get_or_404(pid)
-    if product.pdf_filename:
-        pdf_path = os.path.join("uploads", product.pdf_filename)
-        if os.path.exists(pdf_path):
-            try:
-                os.remove(pdf_path)
-            except:
-                pass
-    db.session.delete(product)
-    db.session.commit()
-    flash("상품이 삭제되었습니다.", "success")
-    return redirect("/admin")
 
-
-@app.route("/admin/product/new", methods=["GET","POST"])
-@app.route("/admin/product/<int:pid>", methods=["GET","POST"])
-@admin_required
-def admin_product(pid=None):
-    product = Product.query.get(pid) if pid else None
-    if request.method == "POST":
-        if not product:
-            product = Product(); db.session.add(product)
-        product.title = request.form.get("title","").strip()
-        product.description = request.form.get("description","")
-        product.price = int(request.form.get("price") or 0)
-        try:
-            product.stock = int(request.form.get("stock") or 0)
-        except ValueError:
-            product.stock = 0
-        product.account_list_url = request.form.get("account_list_url","").strip()
-        product.is_active = True
-        f = request.files.get("pdf")
-        if f and f.filename:
-            fn = secure_filename(f"{secrets.token_hex(4)}_{f.filename}")
-            f.save(os.path.join("uploads", fn))
-            product.pdf_filename = fn
-        db.session.commit(); flash("저장되었습니다.","success")
-        return redirect("/admin")
-    tv = product.title if product else ""
-    dv = product.description if product else ""
-    pv = product.price if product else ""
-    sv = product.stock if product and product.stock is not None else 10
-    au = product.account_list_url if product else ""
-    return render(f'''<div class="max-w-lg mx-auto bg-white rounded-xl border p-8">
-    <h1 class="text-2xl font-bold mb-6">{'상품 수정' if product else '상품 추가'}</h1>
-    <form method="post" enctype="multipart/form-data" class="space-y-4">
-    <input name="title" value="{tv}" placeholder="제목" required class="w-full border rounded-lg px-4 py-2">
-    <textarea name="description" rows="5" placeholder="설명" class="w-full border rounded-lg px-4 py-2">{dv}</textarea>
-    <input name="price" type="number" value="{pv}" placeholder="가격" required class="w-full border rounded-lg px-4 py-2">
-    <input name="stock" type="number" value="{sv}" placeholder="재고 수량" min="0" class="w-full border rounded-lg px-4 py-2">
-    <p class="text-xs text-gray-500 -mt-2">로블록스 계정은 재고를 정확히 입력하세요. 결제완료 시 1개씩 차감됩니다.</p>
-    <input name="account_list_url" value="{au}" placeholder="GitHub raw 계정 목록 URL (로블록스용)" class="w-full border rounded-lg px-4 py-2">
-    <p class="text-xs text-gray-500 -mt-2">예: https://raw.githubusercontent.com/유저/repo/main/accounts.txt<br>
-    한 줄에 계정 하나 (예: 아이디:비번). #으로 시작하는 줄은 무시. 이미 지급된 줄은 건너뜀.</p>
-    <input name="pdf" type="file" accept=".pdf" class="w-full">
-    <button class="w-full bg-indigo-600 text-white py-3 rounded-lg">저장</button>
-    </form></div>''')
-
-
-# ==================== API 엔드포인트 ====================
-
-@app.route("/api/health")
-def api_health():
-    return jsonify({
-        "status": "ok",
-        "service": "daon-class-api",
-        "domain": "daonshop.cloud",
-        "chat_enabled": True,
-        "time": datetime.utcnow().isoformat() + "Z"
-    })
-
-
-@app.route("/api/products")
-def api_products():
-    products = Product.query.filter_by(is_active=True).all()
-    return jsonify([{
-        "id": p.id,
-        "title": p.title,
-        "description": p.description,
-        "price": p.price,
-        "has_pdf": bool(p.pdf_filename)
-    } for p in products])
-
-
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
-    """규칙 기반 상담 봇 (API 크레딧 없음)"""
-    data = request.get_json(silent=True) or {}
-    message = (data.get("message") or "").strip()
-    if not message:
-        return jsonify({"error": "메시지를 입력해 주세요."}), 400
-    reply = get_bot_reply(message)
-    return jsonify({"reply": reply, "model": "faq-bot"})
-
-
-@app.route("/api/info")
-def api_info():
-    return jsonify({
-        "name": "다온 클래스",
-        "domain": "daonshop.cloud",
-        "api_domain": null,
-        "bank": {
-            "name": BANK_NAME,
-            "account": BANK_ACCOUNT,
-            "holder": BANK_HOLDER,
-        },
-        "features": ["강의 판매", "무통장 입금", "PDF 다운로드", "AI 실시간 상담 봇"],
-    })
-
+# ======================
+# Run (Render compatible)
+# ======================
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=os.environ.get("FLASK_DEBUG") == "1")
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    print(f"{APP_NAME} v{VERSION}")
+    print(f"Bank: {BANK_INFO['bank']} {BANK_INFO['account']} ({BANK_INFO['holder']})")
+    print(f"Listening on port {port}")
+    print(f"Admin: /admin  (user={kimsiwoo} / pass={kimsiwoo})")
+    uvicorn.run(app, host="0.0.0.0", port=port)
