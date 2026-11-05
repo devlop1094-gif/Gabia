@@ -427,247 +427,243 @@ def _junk_block() -> str:
     )
 
 
-def _emit_vm(src: str, intensity: str) -> str:
-    """
-    Emit:
-      return setmetatable({...}, {__index=...}):ENTRY()
-    The loaded original chunk's return values are propagated (no silent nil).
-    """
-    raw = src.encode("utf-8")
-    seed = random.randint(0x10000, 0x7FFFFFFF)
-    packed = _pack_bytes(raw, seed)
-    chunks = _split_table(packed)
-
-    id_bxor = _rand_ident(4)
-    id_dec = _rand_ident(4)
-    id_main = _rand_ident(4)
-    id_bc = _rand_ident(4)
-    id_buf = _rand_ident(4)
-    id_key = _rand_ident(3)
-    id_len = _rand_ident(3)
-    id_i = _rand_ident(2)
-    id_j = _rand_ident(2)
-    id_t = _rand_ident(2)
-    id_pc = _rand_ident(3)
-    id_op = _rand_ident(3)
-    id_run = _rand_ident(4)
-    id_fn = _rand_ident(3)
-    id_err = _rand_ident(3)
-    id_st = _rand_ident(3)
-    id_ret = _rand_ident(3)
-    id_loader = _rand_ident(4)
-
-    bc_parts = ",".join(_emit_number_table(c) for c in chunks)
-
-    st_init, st_decode, st_build, st_load, st_run, st_done = (
-        _num(1), _num(2), _num(3), _num(4), _num(5), _num(6)
+def _b85_alphabet() -> str:
+    return (
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        "!#$%&()*+./:;<=>?@[]^_{|}~"
     )
-    junk1 = _junk_block()
-    junk2 = _junk_block()
-    ot = _opaque_true()
-
-    # Portable byte XOR (x^y^z) without bit32
-    bxor_fn = f"""local function {id_bxor}(x,y,z)
-x=math.floor(x)%{_num(256)};y=math.floor(y)%{_num(256)};z=math.floor(z)%{_num(256)}
-local r,p={_num(0)},{_num(1)}
-for _=1,{_num(8)} do
-local bx,by,bz=x%{_num(2)},y%{_num(2)},z%{_num(2)}
-r=r+((bx+by+bz)%{_num(2)})*p
-x=math.floor(x/{_num(2)});y=math.floor(y/{_num(2)});z=math.floor(z/{_num(2)});p=p*{_num(2)}
-end
-return r
-end"""
-
-    dec_fn = f"""local function {id_dec}(word,key,pos,out,olen)
-key=(key*{_num(1664525)}+{_num(1013904223)})%{_num(4294967296)}
-word=math.floor(word)
-for a=0,3 do
-if pos<olen then
-local div={_num(1)}
-for _=1,a do div=div*{_num(256)} end
-local kb=math.floor(key/div)%{_num(256)}
-local b=math.floor(word/div)%{_num(256)}
-pos=pos+{_num(1)}
-out[pos]={id_bxor}(b,kb,(pos-{_num(1)})%{_num(256)})
-end
-end
-return key,pos
-end"""
-
-    # CRITICAL: return the chunk's return value(s)
-    main_fn = f"""local function {id_main}(...)
-local {id_bc}={{{bc_parts}}}
-local {id_buf}={{}}
-local {id_key}={_num(seed)}
-local {id_len}={_num(len(raw))}
-local {id_j}={_num(0)}
-local {id_st}={st_init}
-local {id_run},{id_fn},{id_err},{id_ret}
-local {id_loader}=load or loadstring
-{junk1}
-while {id_st}~={st_done} do
-if {id_st}=={st_init} then
-{junk2}
-{id_st}={st_decode}
-elseif {id_st}=={st_decode} then
-local {id_i}={_num(1)}
-while {id_i}<=#{id_bc} do
-local {id_t}={id_bc}[{id_i}]
-{id_i}={id_i}+{_num(1)}
-if type({id_t})=="table" then
-local {id_pc}={_num(1)}
-while {id_pc}<=#{id_t} do
-local {id_op}={id_t}[{id_pc}]
-{id_pc}={id_pc}+{_num(1)}
-{id_key},{id_j}={id_dec}({id_op},{id_key},{id_j},{id_buf},{id_len})
-end
-end
-end
-{id_st}={st_build}
-elseif {id_st}=={st_build} then
-local t={{}}
-for {id_i}=1,{id_len} do t[{id_i}]=string.char({id_buf}[{id_i}]) end
-{id_run}=table.concat(t)
-{id_st}={st_load}
-elseif {id_st}=={st_load} then
-{id_fn},{id_err}={id_loader}({id_run})
-if not {id_fn} then error({id_err} or "load failed") end
-{id_st}={st_run}
-elseif {id_st}=={st_run} then
-if {ot} then
-{id_ret}={id_fn}(...)
-else
-{id_ret}={id_fn}(...)
-end
-{id_st}={st_done}
-else
-{id_st}={st_done}
-end
-end
-return {id_ret}
-end"""
-
-    k_main = random.randint(0x40, 0xFF)
-    k_boot = random.randint(0x100, 0x3FF)
-    handler_main = _num(k_main)
-    handler_boot = _num(k_boot)
-    entry = random.choice(["B", "R", "X", "K", "Z", "Q"])
-
-    vm = f"""return setmetatable({{
-[{handler_main}]=function(self,...)
-{bxor_fn}
-{dec_fn}
-{main_fn}
-return {id_main}(...)
-end,
-[{handler_boot}]=function(self,...)
-return self[{handler_main}](self,...)
-end,
-}},{{
-__index=function(t,k)
-if k=="{entry}" then return t[{handler_boot}] end
-end
-}}):{entry}(...)"""
-
-    if intensity == "v2":
-        vm = " ".join(vm.split())
-    else:
-        vm = "\n".join(ln.rstrip() for ln in vm.splitlines() if ln.strip())
-    return vm
 
 
-def _emit_chunk_layer(src: str) -> str:
-    """Extra layer: split source into XOR'd char-code chunks, rebuild + load."""
-    data = src.encode("utf-8")
-    key = random.randint(1, 255)
-    cs = random.randint(24, 40)
-    chunks = []
-    for i in range(0, len(data), cs):
-        part = data[i:i + cs]
-        enc = [(b ^ ((key + i + j) & 0xFF)) for j, b in enumerate(part)]
-        chunks.append(enc)
+def _encode_payload(data: bytes, key: bytes):
+    alphabet_list = list(_b85_alphabet())
+    random.shuffle(alphabet_list)
+    alphabet = "".join(alphabet_list)
+    base = len(alphabet)
 
-    id_k = _rand_ident(3)
-    id_b = _rand_ident(4)
-    id_o = _rand_ident(3)
-    id_i = _rand_ident(2)
-    id_j = _rand_ident(2)
-    id_t = _rand_ident(2)
-    id_s = _rand_ident(3)
-    id_f = _rand_ident(3)
-    id_e = _rand_ident(3)
-    id_r = _rand_ident(3)
+    out = bytearray(len(data))
+    for i, b in enumerate(data):
+        out[i] = b ^ key[i % len(key)] ^ ((i * 131) & 0xFF)
 
-    tbl_parts = []
-    for ch in chunks:
-        tbl_parts.append("{" + ",".join(_num(x) for x in ch) + "}")
-    tbl = "{" + ",".join(tbl_parts) + "}"
+    pad = (4 - (len(out) % 4)) % 4
+    out = out + bytes(pad)
+    encoded = []
+    i = 0
+    while i < len(out):
+        n = out[i] | (out[i + 1] << 8) | (out[i + 2] << 16) | (out[i + 3] << 24)
+        i += 4
+        for _ in range(5):
+            encoded.append(alphabet[n % base])
+            n //= base
+    payload = "LPH" + "".join(encoded)
 
+    used = list(sorted(set(payload)))
+    vals = used[:]
+    random.shuffle(vals)
+    sub = {used[i]: vals[i] for i in range(len(used))}
+    scrambled = "".join(sub[c] for c in payload)
+    inv = {v: k for k, v in sub.items()}
+    return scrambled, inv, alphabet, pad
+
+
+def _rename_vars(src: str) -> str:
+    reserved = {
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
+        "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return",
+        "then", "true", "until", "while", "self", "_G", "_ENV", "pairs", "ipairs",
+        "print", "type", "tostring", "tonumber", "require", "pcall", "xpcall",
+        "error", "assert", "select", "unpack", "next", "rawget", "rawset",
+        "setmetatable", "getmetatable", "string", "table", "math", "bit32",
+        "coroutine", "buffer", "task", "game", "workspace", "script",
+        "load", "loadstring", "typeof",
+    }
+    mapping = {}
+
+    def new_name():
+        return _rand_ident(random.randint(6, 10))
+
+    def ren_func(m):
+        prefix, name = m.group(1), m.group(2)
+        if name in reserved or len(name) <= 1:
+            return m.group(0)
+        if name not in mapping:
+            mapping[name] = new_name()
+        return f"{prefix}{mapping[name]}"
+
+    src = re.sub(
+        r"\b(local\s+function\s+|function\s+)([A-Za-z_][A-Za-z0-9_]*)",
+        ren_func,
+        src,
+    )
+
+    def ren_local(m):
+        names = m.group(1)
+        parts = [p.strip() for p in names.split(",")]
+        out = []
+        for p in parts:
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", p):
+                if p not in reserved and len(p) > 1:
+                    if p not in mapping:
+                        mapping[p] = new_name()
+                    out.append(mapping[p])
+                else:
+                    out.append(p)
+            else:
+                out.append(p)
+        return "local " + ", ".join(out)
+
+    src = re.sub(
+        r"\blocal\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)",
+        ren_local,
+        src,
+    )
+    for old in sorted(mapping.keys(), key=len, reverse=True):
+        src = re.sub(rf"\b{re.escape(old)}\b", mapping[old], src)
+    return src
+
+
+def _emit_vm(src: str, intensity: str) -> str:
+    """Luraph v15-inspired envelope: setmetatable + LPH payload + submap + numeric slots."""
+    raw = src.encode("utf-8")
+    key = bytes(random.randint(0, 255) for _ in range(16))
+    scrambled, inv, alphabet, pad = _encode_payload(raw, key)
+
+    parts = []
+    for k, v in inv.items():
+        ks = k.replace("\\", "\\\\").replace('"', '\\"')
+        vs = v.replace("\\", "\\\\").replace('"', '\\"')
+        parts.append(f'["{ks}"]="{vs}"')
+    random.shuffle(parts)
+    submap_lua = "{" + ",".join(parts) + "}"
+
+    slots = list(range(12, 140))
+    random.shuffle(slots)
+    (
+        s_char, s_gsub, s_concat, s_bxor, s_floor, s_type,
+        s_payload, s_submap, s_key, s_len, s_alpha, s_pad,
+        s_dec, s_run, s_boot
+    ) = slots[:15]
+
+    entry = random.choice(["N", "B", "R", "X", "K", "Z", "Q"])
     ot = _opaque_true()
     junk = _junk_block()
+    key_tbl = "{" + ",".join(_num(b) for b in key) + "}"
 
-    code = f"""return (function(...)
-local {id_k}={_num(key)}
-local {id_b}={tbl}
-local {id_o}={{}}
-local {id_i}=0
-for {id_t}=1,#{id_b} do
-local {id_s}={id_b}[{id_t}]
-for {id_j}=1,#{id_s} do
-local c={id_s}[{id_j}]
-{id_i}={id_i}+1
-{id_o}[{id_i}]=string.char(c~(({id_k}+({id_i}-1))%256))
+    eq = "="
+    while f"]{eq}]" in scrambled:
+        eq += "="
+    payload_lit = f"[{eq}[{scrambled}]{eq}]"
+    alpha_esc = alphabet.replace("\\", "\\\\").replace('"', '\\"')
+
+    body = f"""return setmetatable({{
+[{_num(s_char)}]=string.char,
+[{_num(s_gsub)}]=string.gsub,
+[{_num(s_concat)}]=table.concat,
+[{_num(s_floor)}]=math.floor,
+[{_num(s_type)}]=type,
+[{_num(s_payload)}]={payload_lit},
+[{_num(s_submap)}]={submap_lua},
+[{_num(s_key)}]={key_tbl},
+[{_num(s_len)}]={_num(len(raw))},
+[{_num(s_alpha)}]="{alpha_esc}",
+[{_num(s_pad)}]={_num(pad)},
+[{_num(s_bxor)}]=function(self,x,y)
+x=self[{_num(s_floor)}](x)%{_num(256)};y=self[{_num(s_floor)}](y)%{_num(256)}
+local r,p={_num(0)},{_num(1)}
+for _=1,{_num(8)} do
+local bx,by=x%{_num(2)},y%{_num(2)}
+r=r+((bx+by)%{_num(2)})*p
+x=self[{_num(s_floor)}](x/{_num(2)});y=self[{_num(s_floor)}](y/{_num(2)});p=p*{_num(2)}
+end
+return r
+end,
+[{_num(s_dec)}]=function(self)
+local S=self[{_num(s_payload)}]
+local M=self[{_num(s_submap)}]
+local A=self[{_num(s_alpha)}]
+local K=self[{_num(s_key)}]
+local L=self[{_num(s_len)}]
+local base=#A
+local idx={{}}
+for i=1,base do idx[A:sub(i,i)]=i-1 end
+local plain=self[{_num(s_gsub)}](S,".",function(c)return M[c] or c end)
+if plain:sub(1,3)~="LPH" then error("LPH") end
+plain=plain:sub(4)
+local digits={{}}
+for i=1,#plain do
+digits[#digits+1]=idx[plain:sub(i,i)]
+end
+local bytes={{}}
+local di=1
+while di+4<=#digits do
+local n={_num(0)}
+local p={_num(1)}
+for j=0,4 do
+n=n+(digits[di+j] or 0)*p
+p=p*base
+end
+di=di+5
+for j=0,3 do
+bytes[#bytes+1]=n%{_num(256)}
+n=self[{_num(s_floor)}](n/{_num(256)})
 end
 end
+local out={{}}
+for i=1,L do
+local kb=K[((i-1)%#K)+1]
+local xb=self[{_num(s_bxor)}](self,bytes[i],kb)
+out[i]=self[{_num(s_char)}](self[{_num(s_bxor)}](self,xb,(i-1)*{_num(131)}))
+end
+return self[{_num(s_concat)}](out)
+end,
+[{_num(s_run)}]=function(self,...)
 {junk}
-local {id_r}=table.concat({id_o})
-local {id_f},{id_e}=(load or loadstring)({id_r})
-if not {id_f} then error({id_e} or "layer") end
-if {ot} then return {id_f}(...) end
-return {id_f}(...)
-end)(...)"""
-    return " ".join(code.split())
+local src=self[{_num(s_dec)}](self)
+local loader=load or loadstring
+local fn,err=loader(src)
+if not fn then error(err or "load") end
+if {ot} then return fn(...) end
+return fn(...)
+end,
+[{_num(s_boot)}]=function(self,...)
+return self[{_num(s_run)}](self,...)
+end,
+["{entry}"]=function(self,...)
+return self[{_num(s_boot)}](self,...)
+end
+}},{{__index=function(t,k)return rawget(t,k)end}}):{entry}(...)"""
+
+    if intensity == "v2":
+        body = " ".join(body.split())
+    else:
+        body = "\n".join(ln.rstrip() for ln in body.splitlines() if ln.strip())
+    return body
 
 
 def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     code = (code or "").strip()
     if not code:
         return "-- empty"
-
     if intensity not in ("v1", "v2"):
         intensity = "v2"
-
     cleaned = []
     for line in code.splitlines():
-        s = line.strip()
-        if s.startswith("--"):
+        if line.strip().startswith("--"):
             continue
         cleaned.append(line)
     src = "\n".join(cleaned)
     if not src.strip():
         src = code
 
-    # Multi-layer (fresh keys each pass). Avoid exponential size blow-up.
-    # v1: chunk → VM → VM
-    # v2: chunk → VM → chunk → VM → VM (outer minified)
-    body = src
-    if intensity == "v1":
-        # 3 layers: chunk + VM + VM
-        body = _emit_chunk_layer(body)
-        body = _emit_vm(body, "v1")
-        body = _emit_vm(body, "v1")
-    else:
-        # 4 layers: chunk + VM + chunk + outer VM (minified)
-        body = _emit_chunk_layer(body)
-        body = _emit_vm(body, "v1")
-        body = _emit_chunk_layer(body)
-        body = _emit_vm(body, "v2")
+    renamed = _rename_vars(src)
+    layer1 = _emit_vm(renamed, "v1")
+    layer2 = _emit_vm(layer1, "v2" if intensity == "v2" else "v1")
 
     header = (
-        f"-- Protected using {APP_NAME} Obfuscator {VERSION}\n"
-        f"-- {datetime.utcnow().strftime('%Y-%m-%d')} | {intensity} | multi-layer\n"
+        f"-- This file was protected using {APP_NAME} Obfuscator {VERSION} "
+        f"[Luraph-style multi-layer]\n"
+        f"-- {datetime.utcnow().strftime('%Y-%m-%d')} | {intensity}\n"
     )
-    return header + body
+    return header + layer2
 
 
 
