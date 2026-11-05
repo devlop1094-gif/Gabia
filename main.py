@@ -576,6 +576,59 @@ end
     return vm
 
 
+def _emit_chunk_layer(src: str) -> str:
+    """Extra layer: split source into XOR'd char-code chunks, rebuild + load."""
+    data = src.encode("utf-8")
+    key = random.randint(1, 255)
+    cs = random.randint(24, 40)
+    chunks = []
+    for i in range(0, len(data), cs):
+        part = data[i:i + cs]
+        enc = [(b ^ ((key + i + j) & 0xFF)) for j, b in enumerate(part)]
+        chunks.append(enc)
+
+    id_k = _rand_ident(3)
+    id_b = _rand_ident(4)
+    id_o = _rand_ident(3)
+    id_i = _rand_ident(2)
+    id_j = _rand_ident(2)
+    id_t = _rand_ident(2)
+    id_s = _rand_ident(3)
+    id_f = _rand_ident(3)
+    id_e = _rand_ident(3)
+    id_r = _rand_ident(3)
+
+    tbl_parts = []
+    for ch in chunks:
+        tbl_parts.append("{" + ",".join(_num(x) for x in ch) + "}")
+    tbl = "{" + ",".join(tbl_parts) + "}"
+
+    ot = _opaque_true()
+    junk = _junk_block()
+
+    code = f"""return (function(...)
+local {id_k}={_num(key)}
+local {id_b}={tbl}
+local {id_o}={{}}
+local {id_i}=0
+for {id_t}=1,#{id_b} do
+local {id_s}={id_b}[{id_t}]
+for {id_j}=1,#{id_s} do
+local c={id_s}[{id_j}]
+{id_i}={id_i}+1
+{id_o}[{id_i}]=string.char(c~(({id_k}+({id_i}-1))%256))
+end
+end
+{junk}
+local {id_r}=table.concat({id_o})
+local {id_f},{id_e}=(load or loadstring)({id_r})
+if not {id_f} then error({id_e} or "layer") end
+if {ot} then return {id_f}(...) end
+return {id_f}(...)
+end)(...)"""
+    return " ".join(code.split())
+
+
 def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     code = (code or "").strip()
     if not code:
@@ -594,13 +647,25 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     if not src.strip():
         src = code
 
-    body = _emit_vm(src, intensity)
-    if intensity == "v2":
+    # Multi-layer (fresh keys each pass). Avoid exponential size blow-up.
+    # v1: chunk → VM → VM
+    # v2: chunk → VM → chunk → VM → VM (outer minified)
+    body = src
+    if intensity == "v1":
+        # 3 layers: chunk + VM + VM
+        body = _emit_chunk_layer(body)
+        body = _emit_vm(body, "v1")
+        body = _emit_vm(body, "v1")
+    else:
+        # 4 layers: chunk + VM + chunk + outer VM (minified)
+        body = _emit_chunk_layer(body)
+        body = _emit_vm(body, "v1")
+        body = _emit_chunk_layer(body)
         body = _emit_vm(body, "v2")
 
     header = (
         f"-- Protected using {APP_NAME} Obfuscator {VERSION}\n"
-        f"-- {datetime.utcnow().strftime('%Y-%m-%d')} | {intensity}\n"
+        f"-- {datetime.utcnow().strftime('%Y-%m-%d')} | {intensity} | multi-layer\n"
     )
     return header + body
 
