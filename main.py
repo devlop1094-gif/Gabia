@@ -173,7 +173,31 @@ def _init_db_on(conn):
             password TEXT NOT NULL,
             credits INTEGER NOT NULL DEFAULT 0,
             results TEXT DEFAULT '{}',
+            email TEXT DEFAULT '',
+            phone TEXT DEFAULT '',
             created_at TEXT
+        )
+    """)
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT DEFAULT ''")
+    except Exception:
+        pass
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS phone TEXT DEFAULT ''")
+    except Exception:
+        pass
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS access_logs (
+            id SERIAL PRIMARY KEY,
+            created_at TEXT,
+            ip TEXT,
+            path TEXT,
+            method TEXT,
+            username TEXT,
+            email TEXT,
+            user_agent TEXT,
+            device TEXT,
+            referer TEXT
         )
     """)
     conn.execute("""
@@ -186,6 +210,13 @@ def _init_db_on(conn):
     conn.execute("""
         CREATE TABLE IF NOT EXISTS admin_sessions (
             token TEXT PRIMARY KEY,
+            created_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS discord_links (
+            discord_id TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
             created_at TEXT
         )
     """)
@@ -586,6 +617,70 @@ app = FastAPI(title=APP_NAME, version=VERSION)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
+def _client_ip(request: Request) -> str:
+    xf = request.headers.get("x-forwarded-for") or request.headers.get("x-real-ip") or ""
+    if xf:
+        return xf.split(",")[0].strip()
+    if request.client:
+        return request.client.host or ""
+    return ""
+
+
+def _device_from_ua(ua: str) -> str:
+    ua_l = (ua or "").lower()
+    if any(x in ua_l for x in ("iphone", "android", "mobile", "ipad")):
+        if "ipad" in ua_l:
+            return "Tablet"
+        return "Phone"
+    if any(x in ua_l for x in ("windows", "macintosh", "linux", "cros")):
+        return "PC"
+    return "Unknown"
+
+
+@app.middleware("http")
+async def access_log_middleware(request: Request, call_next):
+    response = await call_next(request)
+    try:
+        path = request.url.path or "/"
+        # skip static-ish / noisy
+        if path.startswith("/db-check") or path.endswith(".ico"):
+            return response
+        ua = request.headers.get("user-agent") or ""
+        username = ""
+        email = ""
+        phone = ""
+        try:
+            user = get_current_user(request)
+            if user:
+                username = user.get("username") or ""
+                email = user.get("email") or ""
+                phone = user.get("phone") or ""
+        except Exception:
+            pass
+        conn = get_db()
+        conn.execute(
+            """INSERT INTO access_logs
+               (created_at, ip, path, method, username, email, user_agent, device, referer)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            (
+                datetime.utcnow().isoformat(),
+                _client_ip(request),
+                path[:300],
+                request.method,
+                username,
+                (email + ((" / " + phone) if phone else ""))[:200],
+                ua[:500],
+                _device_from_ua(ua),
+                (request.headers.get("referer") or "")[:300],
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[access_log] {e}")
+    return response
+
+
 def get_site(request: Request) -> str:
     """Return 'shop' or 'api' from URL path (single domain, no subdomain)."""
     p = request.url.path or "/"
@@ -707,7 +802,7 @@ label{{font-size:13px;color:var(--muted);font-weight:600}}
 <div class="topbar">
   <button type="button" class="menu-btn" onclick="openNav()" aria-label="Open menu">☰</button>
   <div style="font-weight:800;color:var(--purple)">{brand}</div>
-  <button type="button" class="menu-btn" onclick="tryCloseTab()" title="Close" aria-label="Close">✕</button>
+  <div style="width:40px"></div>
 </div>
 <div class="sidebar-backdrop" id="navBackdrop" onclick="closeNav()"></div>
 <div class="layout">
@@ -731,11 +826,6 @@ function openNav(){{
 function closeNav(){{
   document.getElementById('sidebar').classList.remove('open');
   document.getElementById('navBackdrop').classList.remove('show');
-}}
-function tryCloseTab(){{
-  // works when this tab was opened by script; otherwise go home
-  window.close();
-  setTimeout(function(){{ window.location.href='/'; }}, 150);
 }}
 </script>
 </body>
@@ -820,6 +910,10 @@ async def register_page(request: Request, lang: str = "en"):
             <input name="username" required minlength="3" maxlength="32" pattern="[a-zA-Z0-9_]+">
             <label>{t('password', lang)}</label>
             <input type="password" name="password" required minlength="4">
+            <label>Email (optional)</label>
+            <input type="email" name="email" placeholder="you@email.com">
+            <label>Phone (optional)</label>
+            <input name="phone" placeholder="+82...">
             <button type="submit">{t('register', lang)}</button>
         </form>
         <p class="muted" style="margin-top:16px"><a href="/login?lang={lang}" style="color:#a5b4fc">{t('login', lang)}</a></p>
@@ -827,8 +921,10 @@ async def register_page(request: Request, lang: str = "en"):
     return base_html(content, lang, site=site)
 
 @app.post("/register")
-async def register(username: str = Form(...), password: str = Form(...), lang: str = Form("en")):
+async def register(username: str = Form(...), password: str = Form(...), email: str = Form(""), phone: str = Form(""), lang: str = Form("en")):
     username = username.strip().lower()
+    email = (email or "").strip().lower()
+    phone = (phone or "").strip()
     try:
         conn = get_db()
         exists = conn.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone()
@@ -839,8 +935,8 @@ async def register(username: str = Form(...), password: str = Form(...), lang: s
             return HTMLResponse(base_html(content, lang))
         created = datetime.utcnow().isoformat()
         conn.execute(
-            "INSERT INTO users (username, password, credits, results, created_at) VALUES (?,?,?,?,?)",
-            (username, hash_password(password), 0, "{}", created)
+            "INSERT INTO users (username, password, credits, results, email, phone, created_at) VALUES (?,?,?,?,?,?,?)",
+            (username, hash_password(password), 0, "{}", email, phone, created)
         )
         token = create_token()
         conn.execute("INSERT INTO sessions (token, username, created_at) VALUES (?,?,?)", (token, username, created))
@@ -1295,7 +1391,7 @@ async def admin_page(request: Request, lang: str = "en"):
     <div class="card">
         <h2>Admin Dashboard</h2>
         <p class="muted">Payments + free obfuscation</p>
-        <p><a href="/admin/logout" class="btn btn-outline">Admin Logout</a></p>
+        <p><a href="/admin-log" class="btn" style="margin-right:8px">Access Log</a><a href="/admin/logout" class="btn btn-outline">Admin Logout</a></p>
     </div>
     {result_block}
     <div class="card">
@@ -1324,6 +1420,57 @@ async def admin_page(request: Request, lang: str = "en"):
         {done_rows or "<p class='muted'>None</p>"}
     </div>"""
     return base_html(content, lang)
+
+
+
+@app.get("/admin-log", response_class=HTMLResponse)
+async def admin_log(request: Request, lang: str = "en"):
+    if not get_admin(request):
+        return RedirectResponse("/admin", status_code=302)
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM access_logs ORDER BY id DESC LIMIT 300"
+    ).fetchall()
+    conn.close()
+    table = ""
+    for r in rows:
+        r = dict(r)
+        table += f"""
+        <tr>
+          <td style="padding:8px;border-bottom:1px solid var(--border);font-size:12px">{html_lib.escape(str(r.get('created_at') or ''))}</td>
+          <td style="padding:8px;border-bottom:1px solid var(--border);font-size:12px">{html_lib.escape(str(r.get('ip') or ''))}</td>
+          <td style="padding:8px;border-bottom:1px solid var(--border);font-size:12px">{html_lib.escape(str(r.get('device') or ''))}</td>
+          <td style="padding:8px;border-bottom:1px solid var(--border);font-size:12px">{html_lib.escape(str(r.get('username') or '-'))}</td>
+          <td style="padding:8px;border-bottom:1px solid var(--border);font-size:12px">{html_lib.escape(str(r.get('email') or '-'))}</td>
+          <td style="padding:8px;border-bottom:1px solid var(--border);font-size:12px">{html_lib.escape(str(r.get('path') or ''))}</td>
+          <td style="padding:8px;border-bottom:1px solid var(--border);font-size:11px;max-width:180px;overflow:hidden;text-overflow:ellipsis" title="{html_lib.escape(str(r.get('user_agent') or ''))}">{html_lib.escape((str(r.get('user_agent') or ''))[:60])}</td>
+        </tr>"""
+    if not table:
+        table = "<tr><td colspan='7' class='muted' style='padding:12px'>No logs yet.</td></tr>"
+    content = f"""
+    <div class="card">
+        <h2>Access Log</h2>
+        <p class="muted">Recent visitors — IP, device, account, email, path</p>
+        <p style="margin:10px 0"><a class="btn btn-outline" href="/admin">← Admin</a>
+        <a class="btn btn-outline" href="/admin-log" style="margin-left:8px">Refresh</a></p>
+        <div style="overflow-x:auto">
+        <table style="width:100%;border-collapse:collapse;margin-top:12px">
+          <thead>
+            <tr style="text-align:left;font-size:12px;color:var(--muted)">
+              <th style="padding:8px">Time (UTC)</th>
+              <th style="padding:8px">IP</th>
+              <th style="padding:8px">Device</th>
+              <th style="padding:8px">User</th>
+              <th style="padding:8px">Email / Phone</th>
+              <th style="padding:8px">Path</th>
+              <th style="padding:8px">User-Agent</th>
+            </tr>
+          </thead>
+          <tbody>{table}</tbody>
+        </table>
+        </div>
+    </div>"""
+    return base_html(content, lang, site="shop")
 
 
 @app.post("/admin/login")
