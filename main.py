@@ -26,7 +26,7 @@ import string
 # ======================
 
 APP_NAME = "Euana"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # Single domain – shop + obfuscation are different paths (no subdomain)
 # SHOP_PATH = /shop   OBF_PATH = /obfuscate
@@ -558,7 +558,7 @@ def _rename_vars(src: str) -> str:
 
 
 def _emit_vm(src: str, intensity: str) -> str:
-    """Luraph v15-inspired envelope: setmetatable + LPH payload + submap + numeric slots."""
+    """VM envelope: setmetatable + payload + submap + numeric slots."""
     raw = src.encode("utf-8")
     key = bytes(random.randint(0, 255) for _ in range(16))
     scrambled, inv, alphabet, pad = _encode_payload(raw, key)
@@ -694,12 +694,19 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     layer1 = _emit_vm(renamed, "v1")
     layer2 = _emit_vm(layer1, "v2" if intensity == "v2" else "v1")
 
-    header = (
-        f"-- This file was protected using {APP_NAME} Obfuscator {VERSION} "
-        f"[Luraph-style multi-layer]\n"
-        f"-- {datetime.utcnow().strftime('%Y-%m-%d')} | {intensity}\n"
+    nl = chr(10)
+    out = (
+        f"-- Protected by {APP_NAME} {VERSION}" + nl
+        + f"-- {datetime.utcnow().strftime('%Y-%m-%d')} | {intensity}" + nl
+        + layer2
     )
-    return header + layer2
+    lines = []
+    for ln in out.splitlines():
+        low = ln.lower()
+        if "luraph" in low or "multi-layer" in low:
+            continue
+        lines.append(ln)
+    return nl.join(lines) + nl
 
 
 
