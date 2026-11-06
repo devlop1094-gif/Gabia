@@ -26,7 +26,7 @@ import string
 # ======================
 
 APP_NAME = "Euana"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 
 # Single domain – shop + obfuscation are different paths (no subdomain)
 # SHOP_PATH = /shop   OBF_PATH = /obfuscate
@@ -45,13 +45,14 @@ CRYPTO_INFO = {
 ADMIN_USERNAME = "kimsiwoo"
 ADMIN_PASSWORD = "kimsiwoo"
 
-# v1 / v2 both cost 3 credits; v2 uses stronger pipeline
+# v1 / v2 / v3 cost 3 credits; v3 = 6-layer + anti-deobf junk
 BASE_COST = {
     "v1": 3,
     "v2": 3,
+    "v3": 3,
 }
 
-OPTION_COST = {}  # options baked into v1/v2
+OPTION_COST = {}  # options baked into v1/v2/v3
 
 # ======================
 # Database (PostgreSQL via DATABASE_URL)
@@ -446,21 +447,58 @@ def _emit_number_table(nums: list) -> str:
 
 def _opaque_true() -> str:
     a = random.randint(2, 17)
+    b = random.randint(3, 23)
     forms = [
         f"(function()local a={_num(a)}return a*a>={_num(0)}end)()",
         f"(function()local a={_num(a)}return(a+a)==(a*{_num(2)})end)()",
         f"(function()local a={_num(a)}return not(a*a<{_num(0)})end)()",
+        f"(function()local a={_num(a)}local b={_num(b)}return(a*b)==(b*a)end)()",
+        f"(function()local a={_num(a)}return a==a and a~=nil end)()",
+        f"(function()local a={_num(a)}return(a|{_num(0)})==a end)()",
     ]
     return random.choice(forms)
 
 
 def _junk_block() -> str:
-    a, b = _rand_ident(4), _rand_ident(4)
-    n1, n2 = random.randint(1, 99), random.randint(1, 99)
-    return (
-        f"do local {a}={_num(n1)};local {b}={_num(n2)};"
-        f"if {a}*{a}<{_num(0)} then {b}={b}+{_num(1)} end end"
-    )
+    a, b, c = _rand_ident(4), _rand_ident(4), _rand_ident(5)
+    n1, n2, n3 = random.randint(1, 999), random.randint(1, 999), random.randint(100, 9999)
+    forms = [
+        (
+            f"do local {a}={_num(n1)};local {b}={_num(n2)};"
+            f"if {a}*{a}<{_num(0)} then {b}={b}+{_num(1)} end end"
+        ),
+        (
+            f"do local {a}={_num(n1)};local {b}={_num(n2)};local {c}={_num(n3)};"
+            f"if ({a}+{b})*{c}<{_num(0)} then {c}={c}+{_num(7)} end;"
+            f"{a}={a}~{_num(n1)} end"
+        ),
+        (
+            f"do local {a}={_num(n1)};for {b}=1,{_num(3)} do "
+            f"if {a}*{a}<{_num(0)} then {a}={a}+{_num(1)} end end end"
+        ),
+        (
+            f"do local {a}={_num(n1)};local {b}=({_num(n2)}~{_num(n3)});"
+            f"if type({a})~=\"number\" then {b}={b}+{_num(1)} end end"
+        ),
+    ]
+    return random.choice(forms)
+
+
+def _anti_deobf_junk() -> str:
+    """Extra noise: meaningless numbers, fake checks, dead code for v3."""
+    ids = [_rand_ident(random.randint(5, 9)) for _ in range(6)]
+    nums = [random.randint(0x1000, 0xFFFFFF) for _ in range(8)]
+    a, b, c, d, e, f = ids
+    n0, n1, n2, n3, n4, n5, n6, n7 = nums
+    blocks = [
+        f"local {a}={_num(n0)};local {b}={_num(n1)};local {c}={_num(n2)}",
+        f"if {a}~{_num(n3)}=={_num(0)} and {b}*{b}<{_num(0)} then {c}={c}+{_num(n4)} end",
+        f"local {d}=({_num(n5)}+{_num(n6)})%{_num(n7+1 or 1)};local {e}={_num(n0)}^0",
+        f"if type({d})==\"number\" and {e}=={_num(1)} then {f}={_num(n1)} else {f}={_num(n2)} end",
+        f"do local _{_rand_ident(3)}={_num(random.randint(10,9999))} end",
+    ]
+    random.shuffle(blocks)
+    return ";".join(blocks)
 
 
 def _b85_alphabet() -> str:
@@ -579,9 +617,10 @@ def _emit_vm(src: str, intensity: str) -> str:
         s_dec, s_run, s_boot
     ) = slots[:15]
 
-    entry = random.choice(["N", "B", "R", "X", "K", "Z", "Q"])
+    entry = random.choice(["N", "B", "R", "X", "K", "Z", "Q", "M", "W", "Y"])
     ot = _opaque_true()
     junk = _junk_block()
+    extra_junk = _anti_deobf_junk() if intensity == "v3" else ""
     key_tbl = "{" + ",".join(_num(b) for b in key) + "}"
 
     eq = "="
@@ -653,6 +692,7 @@ return self[{_num(s_concat)}](out)
 end,
 [{_num(s_run)}]=function(self,...)
 {junk}
+{extra_junk}
 local src=self[{_num(s_dec)}](self)
 local loader=load or loadstring
 local fn,err=loader(src)
@@ -668,7 +708,7 @@ return self[{_num(s_boot)}](self,...)
 end
 }},{{__index=function(t,k)return rawget(t,k)end}}):{entry}(...)"""
 
-    if intensity == "v2":
+    if intensity in ("v2", "v3"):
         body = " ".join(body.split())
     else:
         body = "\n".join(ln.rstrip() for ln in body.splitlines() if ln.strip())
@@ -679,7 +719,7 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     code = (code or "").strip()
     if not code:
         return "-- empty"
-    if intensity not in ("v1", "v2"):
+    if intensity not in ("v1", "v2", "v3"):
         intensity = "v2"
     cleaned = []
     for line in code.splitlines():
@@ -691,19 +731,32 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
         src = code
 
     renamed = _rename_vars(src)
-    layer1 = _emit_vm(renamed, "v1")
-    layer2 = _emit_vm(layer1, "v2" if intensity == "v2" else "v1")
+
+    # Layer counts by intensity
+    # v1: 2 layers, v2: 4 layers, v3: 6 layers + anti-deobf junk
+    layer_map = {"v1": 2, "v2": 4, "v3": 6}
+    n_layers = layer_map.get(intensity, 4)
+
+    current = renamed
+    for i in range(n_layers):
+        # v3 forces v3 intensity on every layer for extra junk;
+        # otherwise alternate so each envelope differs
+        if intensity == "v3":
+            layer_intensity = "v3"
+        else:
+            layer_intensity = "v2" if (intensity == "v2" or i % 2 == 1) else "v1"
+        current = _emit_vm(current, layer_intensity)
 
     nl = chr(10)
     out = (
         f"-- Protected by {APP_NAME} {VERSION}" + nl
         + f"-- {datetime.utcnow().strftime('%Y-%m-%d')} | {intensity}" + nl
-        + layer2
+        + current
     )
     lines = []
     for ln in out.splitlines():
         low = ln.lower()
-        if "luraph" in low or "multi-layer" in low:
+        if "luraph" in low or "multi-layer" in low or "5-layer" in low:
             continue
         lines.append(ln)
     return nl.join(lines) + nl
@@ -1174,7 +1227,8 @@ async def dashboard(request: Request, lang: str = "en", result_id: str = None, e
             <label>Version</label>
             <select name="intensity">
                 <option value="v1">Euana v1 (standard)</option>
-                <option value="v2" selected>Euana v2 (upgraded + VM)</option>
+                <option value="v2">Euana v2 (upgraded + VM)</option>
+                <option value="v3" selected>Euana v3 (6-layer + anti-deobf)</option>
             </select>
             <label>Code</label>
             <textarea name="code" placeholder="Paste Luau / Lua code here (optional if you upload a file)"></textarea>
@@ -1266,7 +1320,7 @@ async def dashboard(request: Request, lang: str = "en", result_id: str = None, e
 async def do_obfuscate(
     request: Request,
     code: str = Form(""),
-    intensity: str = Form("v2"),
+    intensity: str = Form("v3"),
     lang: str = Form("en"),
     file: UploadFile = File(None),
 ):
@@ -1289,8 +1343,8 @@ async def do_obfuscate(
             status_code=302
         )
 
-    if intensity not in ("v1", "v2"):
-        intensity = "v2"
+    if intensity not in ("v1", "v2", "v3"):
+        intensity = "v3"
 
     cost = CREDITS_PER_OBFUSCATION
     if user["credits"] < cost:
@@ -1793,7 +1847,8 @@ async def admin_page(request: Request, lang: str = "en"):
             <label>Version</label>
             <select name="intensity">
                 <option value="v1">Euana v1</option>
-                <option value="v2" selected>Euana v2</option>
+                <option value="v2">Euana v2</option>
+                <option value="v3" selected>Euana v3</option>
             </select>
             <label>Code</label>
             <textarea name="code" placeholder="Paste Luau / Lua code"></textarea>
@@ -1901,7 +1956,7 @@ async def admin_logout(request: Request):
 async def admin_obfuscate(
     request: Request,
     code: str = Form(""),
-    intensity: str = Form("v2"),
+    intensity: str = Form("v3"),
     lang: str = Form("en"),
     file: UploadFile = File(None),
 ):
@@ -1919,8 +1974,8 @@ async def admin_obfuscate(
     if len(code) < 5:
         return RedirectResponse(f"/admin?lang={lang}&error=Paste+code+or+upload+file", status_code=302)
 
-    if intensity not in ("v1", "v2"):
-        intensity = "v2"
+    if intensity not in ("v1", "v2", "v3"):
+        intensity = "v3"
 
     result = obfuscate_code(code, intensity, [])
     result_id = str(uuid.uuid4())[:8]
