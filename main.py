@@ -1461,7 +1461,7 @@ async def goa_list(request: Request):
         write_block = f"""
         <div class="card">
           <h3>New post (allowed account)</h3>
-          <p class="muted">User: {html_lib.escape(uname or "-")} · IP: {html_lib.escape(ip or "?")}</p>
+          <p class="muted">User: {html_lib.escape(uname or "-")}</p>
           <form method="post" action="/goa/new" enctype="multipart/form-data">
             <label>Title</label>
             <input name="title" required maxlength="120">
@@ -1476,7 +1476,7 @@ async def goa_list(request: Request):
         write_block = f"""
         <div class="card">
           <p class="muted">View only. Posting is for approved logged-in users (or approved IPs).</p>
-          <p class="muted">Login: {html_lib.escape(uname or "not logged in")} · IP: {html_lib.escape(ip or "?")}</p>
+          <p class="muted">Login: {html_lib.escape(uname or "not logged in")}</p>
           {"" if user else '<p><a class="btn" href="/login">Login</a></p>'}
         </div>"""
     content = f"""
@@ -1508,7 +1508,7 @@ async def goa_view(request: Request, post_id: int):
     <div class="card">
       <p><a href="/goa" class="btn btn-outline">← GOA</a></p>
       <h2>{html_lib.escape(p.get('title') or '')}</h2>
-      <p class="muted">#{p['id']} · {html_lib.escape(str(p.get('created_at') or ''))} · IP {html_lib.escape(str(p.get('author_ip') or ''))}</p>
+      <p class="muted">#{p['id']} · {html_lib.escape(str(p.get('created_at') or ''))} · {html_lib.escape(str(p.get('author_ip') or 'anon').split('@')[0])}</p>
       {img}
       <pre style="white-space:pre-wrap;font-family:inherit;background:var(--purple-soft);padding:14px;border-radius:12px;margin-top:12px">{html_lib.escape(p.get('body') or '')}</pre>
     </div>"""
@@ -1556,7 +1556,7 @@ async def goa_new(
         image_data = base64.b64encode(raw).decode("ascii")
 
     conn = get_db()
-    author_tag = f"{uname}@{ip}" if uname else ip
+    author_tag = uname or "anon"
     conn.execute(
         """INSERT INTO goa_posts (title, body, image_mime, image_data, author_ip, created_at)
            VALUES (?,?,?,?,?,?)""",
