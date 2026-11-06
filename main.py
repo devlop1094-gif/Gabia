@@ -238,6 +238,42 @@ def _init_db_on(conn):
             approved_by TEXT
         )
     """)
+    
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS goa_posts (
+            id SERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL,
+            image_mime TEXT,
+            image_data TEXT,
+            author_ip TEXT,
+            created_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS goa_allowed_ips (
+            ip TEXT PRIMARY KEY,
+            note TEXT,
+            created_at TEXT
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS goa_allowed_users (
+            username TEXT PRIMARY KEY,
+            note TEXT,
+            created_at TEXT
+        )
+    """)
+    # seed admin account so owner can post after login
+    try:
+        conn.execute(
+            """INSERT INTO goa_allowed_users (username, note, created_at)
+               VALUES (?, ?, ?) ON CONFLICT (username) DO NOTHING""",
+            (ADMIN_USERNAME, "admin seed", datetime.utcnow().isoformat()),
+        )
+    except Exception:
+        pass
+
     conn.commit()
 
 
@@ -687,6 +723,28 @@ def _client_ip(request: Request) -> str:
     return ""
 
 
+def goa_can_post(ip: str = "", username: str = "") -> bool:
+    """Allow post if username is on allowlist, or IP is on allowlist."""
+    try:
+        conn = get_db()
+        ok = False
+        if username:
+            row = conn.execute(
+                "SELECT 1 FROM goa_allowed_users WHERE username=?",
+                (username.strip().lower(),),
+            ).fetchone()
+            ok = bool(row)
+        if not ok and ip:
+            row = conn.execute(
+                "SELECT 1 FROM goa_allowed_ips WHERE ip=?", (ip,)
+            ).fetchone()
+            ok = bool(row)
+        conn.close()
+        return ok
+    except Exception:
+        return False
+
+
 def _device_from_ua(ua: str) -> str:
     ua_l = (ua or "").lower()
     if any(x in ua_l for x in ("iphone", "android", "mobile", "ipad")):
@@ -769,6 +827,7 @@ def base_html(content: str, lang: str = "en", user=None, site: str = "shop"):
         <a class="nav-item" href="/shop"><span class="ico">▦</span> Dashboard</a>
         <a class="nav-item" href="/shop#purchase"><span class="ico">🛒</span> Purchase</a>
         <a class="nav-item" href="/obfuscate"><span class="ico">◎</span> Obfuscation</a>
+        <a class="nav-item" href="/goa"><span class="ico">📌</span> GOA</a>
         """
     else:
         nav_items = """
@@ -1369,6 +1428,205 @@ def get_admin(request: Request):
     return bool(row)
 
 
+
+# ======================
+# GOA — pinned board (allowed IP can post + image)
+# ======================
+
+@app.get("/goa", response_class=HTMLResponse)
+async def goa_list(request: Request):
+    ip = _client_ip(request)
+    user = get_current_user(request)
+    uname = (user.get("username") if user else "") or ""
+    can = goa_can_post(ip, uname)
+    conn = get_db()
+    posts = [dict(r) for r in conn.execute(
+        "SELECT id, title, author_ip, created_at, "
+        "CASE WHEN image_data IS NOT NULL AND image_data <> '' THEN 1 ELSE 0 END AS has_image "
+        "FROM goa_posts ORDER BY id DESC LIMIT 100"
+    ).fetchall()]
+    conn.close()
+    items = ""
+    for p in posts:
+        img_badge = " · photo" if p.get("has_image") else ""
+        items += f"""
+        <a href="/goa/{p['id']}" class="plan" style="display:block;text-decoration:none;color:inherit">
+          <div class="name">{html_lib.escape(p.get('title') or '')}</div>
+          <div class="muted">#{p['id']} · {html_lib.escape(str(p.get('created_at') or ''))}{img_badge}</div>
+        </a>"""
+    if not items:
+        items = "<p class='muted'>No posts yet.</p>"
+    write_block = ""
+    if can:
+        write_block = f"""
+        <div class="card">
+          <h3>New post (allowed account)</h3>
+          <p class="muted">User: {html_lib.escape(uname or "-")} · IP: {html_lib.escape(ip or "?")}</p>
+          <form method="post" action="/goa/new" enctype="multipart/form-data">
+            <label>Title</label>
+            <input name="title" required maxlength="120">
+            <label>Body</label>
+            <textarea name="body" required placeholder="Write something..."></textarea>
+            <label>Photo (optional, jpg/png/webp, max 3MB)</label>
+            <input type="file" name="image" accept="image/jpeg,image/png,image/webp,image/gif">
+            <button type="submit">Publish</button>
+          </form>
+        </div>"""
+    else:
+        write_block = f"""
+        <div class="card">
+          <p class="muted">View only. Posting is for approved logged-in users (or approved IPs).</p>
+          <p class="muted">Login: {html_lib.escape(uname or "not logged in")} · IP: {html_lib.escape(ip or "?")}</p>
+          {"" if user else '<p><a class="btn" href="/login">Login</a></p>'}
+        </div>"""
+    content = f"""
+    <div class="card">
+      <h2>GOA Board</h2>
+      <p class="muted">Pinned posts — anyone can read, approved IPs can write.</p>
+    </div>
+    {write_block}
+    <div class="card">
+      <h3>Posts</h3>
+      {items}
+    </div>"""
+    return base_html(content, "en", get_current_user(request), site="shop")
+
+
+@app.get("/goa/{post_id}", response_class=HTMLResponse)
+async def goa_view(request: Request, post_id: int):
+    conn = get_db()
+    p = conn.execute("SELECT * FROM goa_posts WHERE id=?", (post_id,)).fetchone()
+    conn.close()
+    if not p:
+        return HTMLResponse(base_html("<div class='card'><p class='error'>Not found</p><a class='btn' href='/goa'>Back</a></div>", "en", site="shop"), status_code=404)
+    p = dict(p)
+    img = ""
+    if p.get("image_data"):
+        mime = p.get("image_mime") or "image/jpeg"
+        img = f'<img src="data:{html_lib.escape(mime)};base64,{p["image_data"]}" style="max-width:100%;border-radius:12px;margin:12px 0" alt="attachment">'
+    content = f"""
+    <div class="card">
+      <p><a href="/goa" class="btn btn-outline">← GOA</a></p>
+      <h2>{html_lib.escape(p.get('title') or '')}</h2>
+      <p class="muted">#{p['id']} · {html_lib.escape(str(p.get('created_at') or ''))} · IP {html_lib.escape(str(p.get('author_ip') or ''))}</p>
+      {img}
+      <pre style="white-space:pre-wrap;font-family:inherit;background:var(--purple-soft);padding:14px;border-radius:12px;margin-top:12px">{html_lib.escape(p.get('body') or '')}</pre>
+    </div>"""
+    return base_html(content, "en", get_current_user(request), site="shop")
+
+
+@app.post("/goa/new")
+async def goa_new(
+    request: Request,
+    title: str = Form(...),
+    body: str = Form(...),
+    image: UploadFile = File(None),
+):
+    ip = _client_ip(request)
+    user = get_current_user(request)
+    uname = (user.get("username") if user else "") or ""
+    if not goa_can_post(ip, uname):
+        return RedirectResponse("/goa", status_code=302)
+    title = (title or "").strip()[:120]
+    body = (body or "").strip()
+    if not title or not body:
+        return RedirectResponse("/goa", status_code=302)
+
+    image_mime = None
+    image_data = None
+    if image and image.filename:
+        raw = await image.read()
+        if len(raw) > 3 * 1024 * 1024:
+            return HTMLResponse(base_html("<div class='card'><p class='error'>Image too large (max 3MB)</p><a class='btn' href='/goa'>Back</a></div>", "en", site="shop"))
+        import base64
+        ctype = (image.content_type or "").lower()
+        if ctype not in ("image/jpeg", "image/png", "image/webp", "image/gif"):
+            # sniff
+            if raw[:3] == b"\xff\xd8\xff":
+                ctype = "image/jpeg"
+            elif raw[:8] == b"\x89PNG\r\n\x1a\n":
+                ctype = "image/png"
+            elif raw[:4] == b"RIFF":
+                ctype = "image/webp"
+            elif raw[:6] in (b"GIF87a", b"GIF89a"):
+                ctype = "image/gif"
+            else:
+                return HTMLResponse(base_html("<div class='card'><p class='error'>Unsupported image type</p><a class='btn' href='/goa'>Back</a></div>", "en", site="shop"))
+        image_mime = ctype
+        image_data = base64.b64encode(raw).decode("ascii")
+
+    conn = get_db()
+    author_tag = f"{uname}@{ip}" if uname else ip
+    conn.execute(
+        """INSERT INTO goa_posts (title, body, image_mime, image_data, author_ip, created_at)
+           VALUES (?,?,?,?,?,?)""",
+        (title, body, image_mime, image_data, author_tag, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    row = conn.execute("SELECT id FROM goa_posts ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    pid = row["id"] if row else ""
+    return RedirectResponse(f"/goa/{pid}", status_code=302)
+
+
+@app.post("/admin/goa-user")
+async def admin_goa_user(request: Request, username: str = Form(...), note: str = Form("")):
+    if not get_admin(request):
+        return RedirectResponse("/admin", status_code=302)
+    username = (username or "").strip().lower()
+    note = (note or "").strip()[:80]
+    if username:
+        conn = get_db()
+        conn.execute(
+            """INSERT INTO goa_allowed_users (username, note, created_at) VALUES (?,?,?)
+               ON CONFLICT (username) DO UPDATE SET note=EXCLUDED.note""",
+            (username, note, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/goa-user-del")
+async def admin_goa_user_del(request: Request, username: str = Form(...)):
+    if not get_admin(request):
+        return RedirectResponse("/admin", status_code=302)
+    conn = get_db()
+    conn.execute("DELETE FROM goa_allowed_users WHERE username=?", ((username or "").strip().lower(),))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/goa-ip")
+async def admin_goa_ip(request: Request, ip: str = Form(...), note: str = Form("")):
+    if not get_admin(request):
+        return RedirectResponse("/admin", status_code=302)
+    ip = (ip or "").strip()
+    note = (note or "").strip()[:80]
+    if ip:
+        conn = get_db()
+        conn.execute(
+            """INSERT INTO goa_allowed_ips (ip, note, created_at) VALUES (?,?,?)
+               ON CONFLICT (ip) DO UPDATE SET note=EXCLUDED.note""",
+            (ip, note, datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    return RedirectResponse("/admin", status_code=302)
+
+
+@app.post("/admin/goa-ip-del")
+async def admin_goa_ip_del(request: Request, ip: str = Form(...)):
+    if not get_admin(request):
+        return RedirectResponse("/admin", status_code=302)
+    conn = get_db()
+    conn.execute("DELETE FROM goa_allowed_ips WHERE ip=?", ((ip or "").strip(),))
+    conn.commit()
+    conn.close()
+    return RedirectResponse("/admin", status_code=302)
+
+
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_page(request: Request, lang: str = "en"):
     if not get_admin(request):
@@ -1390,6 +1648,8 @@ async def admin_page(request: Request, lang: str = "en"):
     conn = get_db()
     pending = [dict(r) for r in conn.execute("SELECT * FROM payments WHERE status='pending' ORDER BY created_at DESC").fetchall()]
     completed = [dict(r) for r in conn.execute("SELECT * FROM payments WHERE status='completed' ORDER BY created_at DESC LIMIT 20").fetchall()]
+    goa_ips = [dict(r) for r in conn.execute("SELECT * FROM goa_allowed_ips ORDER BY created_at DESC").fetchall()]
+    goa_users = [dict(r) for r in conn.execute("SELECT * FROM goa_allowed_users ORDER BY created_at DESC").fetchall()]
     conn.close()
 
     rows = ""
@@ -1448,13 +1708,76 @@ async def admin_page(request: Request, lang: str = "en"):
                 </div>
             </div>"""
 
+    goa_user_rows = ""
+    if not goa_users:
+        goa_user_rows = "<p class='muted'>No users yet. Add a username (e.g. kimsiwoo) to allow posting.</p>"
+    else:
+        for g in goa_users:
+            goa_user_rows += f"""
+            <div class="row" style="justify-content:space-between;margin-bottom:8px;padding:8px;background:var(--purple-soft);border-radius:10px">
+              <span><strong>{html_lib.escape(g.get('username') or '')}</strong>
+              <span class="muted"> {html_lib.escape(g.get('note') or '')}</span></span>
+              <form method="post" action="/admin/goa-user-del" style="margin:0">
+                <input type="hidden" name="username" value="{html_lib.escape(g.get('username') or '')}">
+                <button type="submit" class="btn-outline">Remove</button>
+              </form>
+            </div>"""
+
+    goa_ip_rows = ""
+    if not goa_ips:
+        goa_ip_rows = "<p class='muted'>No IPs (optional).</p>"
+    else:
+        for g in goa_ips:
+            goa_ip_rows += f"""
+            <div class="row" style="justify-content:space-between;margin-bottom:8px;padding:8px;background:var(--purple-soft);border-radius:10px">
+              <span><strong>{html_lib.escape(g.get('ip') or '')}</strong>
+              <span class="muted"> {html_lib.escape(g.get('note') or '')}</span></span>
+              <form method="post" action="/admin/goa-ip-del" style="margin:0">
+                <input type="hidden" name="ip" value="{html_lib.escape(g.get('ip') or '')}">
+                <button type="submit" class="btn-outline">Remove</button>
+              </form>
+            </div>"""
+
     content = f"""
     <div class="card">
         <h2>Admin Dashboard</h2>
-        <p class="muted">Payments + free obfuscation</p>
-        <p><a href="/admin-log" class="btn" style="margin-right:8px">Access Log</a><a href="/admin/logout" class="btn btn-outline">Admin Logout</a></p>
+        <p class="muted">Payments + free obfuscation + GOA</p>
+        <p>
+          <a href="/admin-log" class="btn" style="margin-right:8px">Access Log</a>
+          <a href="/goa" class="btn btn-outline" style="margin-right:8px">GOA Board</a>
+          <a href="/admin/logout" class="btn btn-outline">Admin Logout</a>
+        </p>
     </div>
     {result_block}
+    <div class="card">
+        <h3>GOA allowed users (logged-in accounts that can post)</h3>
+        <form method="post" action="/admin/goa-user" class="row" style="align-items:flex-end">
+          <div style="flex:1;min-width:140px">
+            <label>Username</label>
+            <input name="username" required placeholder="kimsiwoo">
+          </div>
+          <div style="flex:1;min-width:140px">
+            <label>Note</label>
+            <input name="note" placeholder="optional">
+          </div>
+          <button type="submit">Add user</button>
+        </form>
+        <div style="margin-top:12px">{goa_user_rows}</div>
+        <hr style="margin:16px 0;border:none;border-top:1px solid var(--border)">
+        <h3>GOA allowed IPs (optional backup)</h3>
+        <form method="post" action="/admin/goa-ip" class="row" style="align-items:flex-end">
+          <div style="flex:1;min-width:140px">
+            <label>IP</label>
+            <input name="ip" required placeholder="1.2.3.4">
+          </div>
+          <div style="flex:1;min-width:140px">
+            <label>Note</label>
+            <input name="note" placeholder="optional">
+          </div>
+          <button type="submit">Add IP</button>
+        </form>
+        <div style="margin-top:12px">{goa_ip_rows}</div>
+    </div>
     <div class="card">
         <h3>Free Obfuscate (admin only)</h3>
         <p class="muted">No credit cost. Unlimited.</p>
