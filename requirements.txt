@@ -3,3 +3,4 @@ uvicorn[standard]==0.34.0
 python-multipart==0.0.20
 psycopg2-binary==2.9.10
 discord.py==2.4.0
+aiohttp>=3.9.0

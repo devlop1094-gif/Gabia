@@ -222,6 +222,30 @@ def _init_db_on(conn):
         )
     """)
     conn.execute("""
+        CREATE TABLE IF NOT EXISTS bot_api_keys (
+            api_key TEXT PRIMARY KEY,
+            username TEXT NOT NULL,
+            label TEXT DEFAULT '',
+            created_at TEXT,
+            last_used TEXT,
+            enabled INTEGER DEFAULT 1
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS script_keys (
+            user_key TEXT PRIMARY KEY,
+            owner_username TEXT NOT NULL,
+            discord_id TEXT,
+            hwid TEXT,
+            note TEXT DEFAULT '',
+            banned INTEGER DEFAULT 0,
+            executions INTEGER DEFAULT 0,
+            created_at TEXT,
+            expires_at TEXT,
+            last_hwid_reset TEXT
+        )
+    """)
+    conn.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             payment_id TEXT PRIMARY KEY,
             username TEXT NOT NULL,
@@ -2925,3 +2949,369 @@ if __name__ == "__main__":
     print(f"Admin: /admin  (user={ADMIN_USERNAME} / pass={ADMIN_PASSWORD})")
     print(f"DB: PostgreSQL (DATABASE_URL set={bool(DATABASE_URL)})")
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+# ==================== BOT API (Discord /setup key) ====================
+from fastapi import Header, HTTPException
+
+def _user_from_api_key(api_key: str):
+    if not api_key:
+        return None
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM bot_api_keys WHERE api_key=? AND enabled=1",
+        (api_key.strip(),),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return None
+    user = conn.execute(
+        "SELECT * FROM users WHERE username=?", (row["username"],)
+    ).fetchone()
+    conn.execute(
+        "UPDATE bot_api_keys SET last_used=? WHERE api_key=?",
+        (datetime.utcnow().isoformat(), api_key.strip()),
+    )
+    conn.commit()
+    conn.close()
+    return dict(user) if user else None
+
+
+@app.post("/api/bot/create-key")
+async def api_create_bot_key(request: Request, label: str = Form("")):
+    """Logged-in user creates a bot API key (shown once)."""
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({"ok": False, "error": "login required"}, status_code=401)
+    key = "eu_" + secrets.token_urlsafe(24)
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO bot_api_keys (api_key, username, label, created_at, enabled)
+           VALUES (?, ?, ?, ?, 1)""",
+        (key, user["username"], label or "discord-bot", datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": True, "api_key": key, "username": user["username"]})
+
+
+@app.get("/api/bot/me")
+async def api_bot_me(x_api_key: str = Header(None, alias="X-API-Key")):
+    user = _user_from_api_key(x_api_key or "")
+    if not user:
+        return JSONResponse({"ok": False, "error": "invalid api key"}, status_code=401)
+    return JSONResponse({
+        "ok": True,
+        "username": user["username"],
+        "credits": user.get("credits", 0),
+    })
+
+
+@app.post("/api/bot/obfuscate")
+async def api_bot_obfuscate(request: Request, x_api_key: str = Header(None, alias="X-API-Key")):
+    user = _user_from_api_key(x_api_key or "")
+    if not user:
+        return JSONResponse({"ok": False, "error": "invalid api key"}, status_code=401)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    code = body.get("code") or ""
+    intensity = body.get("intensity") or "medium"
+    if not code or len(code) < 2:
+        return JSONResponse({"ok": False, "error": "code required"}, status_code=400)
+    cost = 3
+    # admin free
+    free = user["username"] == ADMIN_USERNAME
+    if not free and int(user.get("credits") or 0) < cost:
+        return JSONResponse({"ok": False, "error": "not enough credits", "credits": user.get("credits", 0)}, status_code=402)
+    try:
+        result = obfuscate_code(code, intensity, [])
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+    if not free:
+        conn = get_db()
+        conn.execute(
+            "UPDATE users SET credits = credits - ? WHERE username=?",
+            (cost, user["username"]),
+        )
+        conn.commit()
+        conn.close()
+    return JSONResponse({
+        "ok": True,
+        "result": result,
+        "credits_spent": 0 if free else cost,
+        "username": user["username"],
+    })
+
+
+@app.get("/api/bot/balance")
+async def api_bot_balance(x_api_key: str = Header(None, alias="X-API-Key")):
+    user = _user_from_api_key(x_api_key or "")
+    if not user:
+        return JSONResponse({"ok": False, "error": "invalid api key"}, status_code=401)
+    return JSONResponse({"ok": True, "username": user["username"], "credits": user.get("credits", 0)})
+
+
+# ==================== SCRIPT KEY / HWID / PROTECT ====================
+def _gen_user_key():
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    return "".join(secrets.choice(alphabet) for _ in range(32))
+
+
+@app.post("/api/script/create-key")
+async def api_script_create_key(request: Request, days: int = Form(0), note: str = Form(""), count: int = Form(1)):
+    user = get_current_user(request)
+    if not user or user.get("username") != ADMIN_USERNAME:
+        return JSONResponse({"ok": False, "error": "admin only"}, status_code=403)
+    count = max(1, min(int(count or 1), 50))
+    days = max(0, int(days or 0))
+    from datetime import timedelta
+    conn = get_db()
+    keys = []
+    for _ in range(count):
+        k = _gen_user_key()
+        exp = (datetime.utcnow() + timedelta(days=days)).isoformat() if days > 0 else None
+        conn.execute(
+            "INSERT INTO script_keys (user_key, owner_username, note, created_at, expires_at, banned, executions) VALUES (?, ?, ?, ?, ?, 0, 0)",
+            (k, user["username"], note or "", datetime.utcnow().isoformat(), exp),
+        )
+        keys.append(k)
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": True, "keys": keys, "days": days})
+
+
+@app.post("/api/script/redeem")
+async def api_script_redeem(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user_key = (body.get("key") or "").strip()
+    discord_id = str(body.get("discord_id") or "").strip()
+    if not user_key or not discord_id:
+        return JSONResponse({"ok": False, "error": "key and discord_id required"}, status_code=400)
+    conn = get_db()
+    row = conn.execute("SELECT * FROM script_keys WHERE user_key=?", (user_key,)).fetchone()
+    if not row:
+        conn.close()
+        return JSONResponse({"ok": False, "error": "invalid key"}, status_code=404)
+    row = dict(row)
+    if row.get("banned"):
+        conn.close()
+        return JSONResponse({"ok": False, "error": "key banned"}, status_code=403)
+    if row.get("expires_at"):
+        try:
+            if datetime.utcnow() > datetime.fromisoformat(row["expires_at"]):
+                conn.close()
+                return JSONResponse({"ok": False, "error": "key expired"}, status_code=403)
+        except Exception:
+            pass
+    if row.get("discord_id") and str(row["discord_id"]) != discord_id:
+        conn.close()
+        return JSONResponse({"ok": False, "error": "key linked to another discord"}, status_code=403)
+    conn.execute("UPDATE script_keys SET discord_id=? WHERE user_key=?", (discord_id, user_key))
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": True, "key": user_key, "discord_id": discord_id})
+
+
+@app.post("/api/script/reset-hwid")
+async def api_script_reset_hwid(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user_key = (body.get("key") or "").strip()
+    discord_id = str(body.get("discord_id") or "").strip()
+    conn = get_db()
+    row = conn.execute("SELECT * FROM script_keys WHERE user_key=?", (user_key,)).fetchone()
+    if not row:
+        conn.close()
+        return JSONResponse({"ok": False, "error": "invalid key"}, status_code=404)
+    row = dict(row)
+    if row.get("discord_id") and str(row["discord_id"]) != discord_id:
+        conn.close()
+        return JSONResponse({"ok": False, "error": "not your key"}, status_code=403)
+    conn.execute(
+        "UPDATE script_keys SET hwid=NULL, last_hwid_reset=? WHERE user_key=?",
+        (datetime.utcnow().isoformat(), user_key),
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": True, "message": "HWID cleared"})
+
+
+@app.post("/api/script/check")
+async def api_script_check(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    user_key = (body.get("key") or "").strip()
+    hwid = (body.get("hwid") or "").strip()
+    conn = get_db()
+    row = conn.execute("SELECT * FROM script_keys WHERE user_key=?", (user_key,)).fetchone()
+    if not row:
+        conn.close()
+        return JSONResponse({"ok": False, "code": "KEY_INCORRECT", "message": "invalid key"})
+    row = dict(row)
+    if row.get("banned"):
+        conn.close()
+        return JSONResponse({"ok": False, "code": "KEY_BANNED", "message": "banned"})
+    if row.get("expires_at"):
+        try:
+            if datetime.utcnow() > datetime.fromisoformat(row["expires_at"]):
+                conn.close()
+                return JSONResponse({"ok": False, "code": "KEY_EXPIRED", "message": "expired"})
+        except Exception:
+            pass
+    if not row.get("hwid"):
+        if hwid:
+            conn.execute(
+                "UPDATE script_keys SET hwid=?, executions=COALESCE(executions,0)+1 WHERE user_key=?",
+                (hwid, user_key),
+            )
+        else:
+            conn.execute(
+                "UPDATE script_keys SET executions=COALESCE(executions,0)+1 WHERE user_key=?",
+                (user_key,),
+            )
+        conn.commit()
+        conn.close()
+        return JSONResponse({"ok": True, "code": "KEY_VALID", "message": "bound"})
+    if hwid and row.get("hwid") != hwid:
+        conn.close()
+        return JSONResponse({"ok": False, "code": "KEY_HWID_LOCKED", "message": "hwid mismatch"})
+    conn.execute(
+        "UPDATE script_keys SET executions=COALESCE(executions,0)+1 WHERE user_key=?",
+        (user_key,),
+    )
+    conn.commit()
+    conn.close()
+    return JSONResponse({"ok": True, "code": "KEY_VALID", "message": "ok"})
+
+
+@app.post("/api/script/protect")
+async def api_script_protect(request: Request):
+    user = get_current_user(request)
+    api_key = request.headers.get("X-API-Key")
+    if (not user or user.get("username") != ADMIN_USERNAME) and api_key:
+        user = _user_from_api_key(api_key)
+    if not user or user.get("username") != ADMIN_USERNAME:
+        return JSONResponse({"ok": False, "error": "admin only"}, status_code=403)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    code = body.get("code") or ""
+    site_url = (body.get("site_url") or "").rstrip("/")
+    intensity = body.get("intensity") or "medium"
+    if not code:
+        return JSONResponse({"ok": False, "error": "code required"}, status_code=400)
+    try:
+        protected_body = obfuscate_code(code, intensity, [])
+    except Exception:
+        protected_body = code
+    # build wrapper without nested f-string hell
+    parts = []
+    parts.append("-- Ruraf protected")
+    parts.append('local script_key = script_key or getgenv().script_key or ""')
+    parts.append("local function _hw()")
+    parts.append("  local ok, h = pcall(function()")
+    parts.append("    if gethwid then return gethwid() end")
+    parts.append('    return tostring(game:GetService("Players").LocalPlayer.UserId)')
+    parts.append("  end)")
+    parts.append('  return ok and h or "unknown"')
+    parts.append("end")
+    parts.append("local function _check()")
+    parts.append('  local hs = game:GetService("HttpService")')
+    parts.append('  local url = "' + site_url + '/api/script/check"')
+    parts.append("  local body = hs:JSONEncode({key=script_key, hwid=_hw()})")
+    parts.append("  local res")
+    parts.append("  if syn and syn.request then")
+    parts.append('    res = syn.request({Url=url, Method="POST", Headers={["Content-Type"]="application/json"}, Body=body})')
+    parts.append("  elseif request then")
+    parts.append('    res = request({Url=url, Method="POST", Headers={["Content-Type"]="application/json"}, Body=body})')
+    parts.append("  else error('no http') end")
+    parts.append("  local data = hs:JSONDecode(res.Body or res.body or '{}')")
+    parts.append("  if not data.ok then error(data.message or data.code or 'key invalid') end")
+    parts.append("end")
+    parts.append("_check()")
+    parts.append("-- payload")
+    parts.append(protected_body)
+    wrapper = "\n".join(parts)
+    return JSONResponse({"ok": True, "result": wrapper})
+
+
+@app.get("/api/script/stats")
+async def api_script_stats(key: str = ""):
+    user_key = (key or "").strip()
+    conn = get_db()
+    row = conn.execute(
+        "SELECT user_key, discord_id, hwid, executions, banned, expires_at, note, created_at FROM script_keys WHERE user_key=?",
+        (user_key,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
+    return JSONResponse({"ok": True, "data": dict(row)})
+
+
+@app.get("/admin/keys", response_class=HTMLResponse)
+async def admin_keys_page(request: Request):
+    user = get_current_user(request)
+    if not user or user.get("username") != ADMIN_USERNAME:
+        return HTMLResponse("<h3>Admin login required</h3><a href='/login'>Login</a>", status_code=401)
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT user_key, discord_id, hwid, executions, banned, expires_at, note, created_at FROM script_keys ORDER BY created_at DESC LIMIT 100"
+    ).fetchall()
+    conn.close()
+    lis = ""
+    for r in rows:
+        r = dict(r)
+        lis += "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            r.get("user_key"), r.get("discord_id") or "-", (r.get("hwid") or "-")[:12],
+            r.get("executions"), "Y" if r.get("banned") else "N", r.get("expires_at") or "life", r.get("note") or ""
+        )
+    html = """<!DOCTYPE html><html><head><meta charset=utf-8><title>Script Keys</title>
+    <style>body{font-family:sans-serif;background:#111;color:#eee;padding:24px}
+    table{border-collapse:collapse;width:100%}td,th{border:1px solid #333;padding:6px;font-size:12px}
+    input,button{padding:8px;margin:4px}</style></head><body>
+    <h2>Script Keys (Admin only)</h2>
+    <form method=post action="/admin/keys/create">
+      days <input name=days value=0 type=number>
+      count <input name=count value=1 type=number>
+      note <input name=note>
+      <button>Create keys</button>
+    </form>
+    <p><a href="/admin">Admin</a></p>
+    <table><tr><th>key</th><th>discord</th><th>hwid</th><th>exec</th><th>ban</th><th>exp</th><th>note</th></tr>
+    %s</table></body></html>""" % lis
+    return HTMLResponse(html)
+
+
+@app.post("/admin/keys/create")
+async def admin_keys_create(request: Request, days: int = Form(0), count: int = Form(1), note: str = Form("")):
+    user = get_current_user(request)
+    if not user or user.get("username") != ADMIN_USERNAME:
+        return HTMLResponse("admin only", status_code=403)
+    count = max(1, min(int(count or 1), 50))
+    from datetime import timedelta
+    conn = get_db()
+    created = []
+    for _ in range(count):
+        k = _gen_user_key()
+        exp = (datetime.utcnow() + timedelta(days=days)).isoformat() if days > 0 else None
+        conn.execute(
+            "INSERT INTO script_keys (user_key, owner_username, note, created_at, expires_at, banned, executions) VALUES (?, ?, ?, ?, ?, 0, 0)",
+            (k, user["username"], note or "", datetime.utcnow().isoformat(), exp),
+        )
+        created.append(k)
+    conn.commit()
+    conn.close()
+    keys_html = "<br>".join("<code>%s</code>" % k for k in created)
+    return HTMLResponse("<h3>Created %d</h3>%s<p><a href='/admin/keys'>Back</a></p>" % (len(created), keys_html))
+
