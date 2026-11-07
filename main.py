@@ -397,6 +397,21 @@ def get_current_user(request: Request):
         user["results"] = {}
     return user
 
+
+def is_admin_request(request: Request) -> bool:
+    token = request.cookies.get("admin_session")
+    if token:
+        conn = get_db()
+        row = conn.execute("SELECT 1 FROM admin_sessions WHERE token=?", (token,)).fetchone()
+        conn.close()
+        if row:
+            return True
+    user = get_current_user(request)
+    if user and user.get("username") == ADMIN_USERNAME:
+        return True
+    return False
+
+
 def save_user(user: dict):
     conn = get_db()
     conn.execute(
@@ -2663,6 +2678,7 @@ async def admin_page(request: Request, lang: str = "en"):
         <h2>Admin Dashboard</h2>
         <p class="muted">Payments + free obfuscation + GOA</p>
         <p>
+          <a href="/admin/keys" class="btn" style="margin-right:8px">Script Keys</a>
           <a href="/admin-log" class="btn" style="margin-right:8px">Access Log</a>
           <a href="/goa" class="btn btn-outline" style="margin-right:8px">GOA Board</a>
           <a href="/admin/logout" class="btn btn-outline">Admin Logout</a>
@@ -3061,9 +3077,9 @@ def _gen_user_key():
 
 @app.post("/api/script/create-key")
 async def api_script_create_key(request: Request, days: int = Form(0), note: str = Form(""), count: int = Form(1)):
-    user = get_current_user(request)
-    if not user or user.get("username") != ADMIN_USERNAME:
+    if not is_admin_request(request):
         return JSONResponse({"ok": False, "error": "admin only"}, status_code=403)
+    user = get_current_user(request) or {"username": ADMIN_USERNAME}
     count = max(1, min(int(count or 1), 50))
     days = max(0, int(days or 0))
     from datetime import timedelta
@@ -3261,9 +3277,11 @@ async def api_script_stats(key: str = ""):
 
 @app.get("/admin/keys", response_class=HTMLResponse)
 async def admin_keys_page(request: Request):
-    user = get_current_user(request)
-    if not user or user.get("username") != ADMIN_USERNAME:
-        return HTMLResponse("<h3>Admin login required</h3><a href='/login'>Login</a>", status_code=401)
+    if not is_admin_request(request):
+        return HTMLResponse(
+            "<h3>Admin login required</h3><p><a href='/admin'>Admin Login</a> · <a href='/login'>User Login</a></p>",
+            status_code=401,
+        )
     conn = get_db()
     rows = conn.execute(
         "SELECT user_key, discord_id, hwid, executions, banned, expires_at, note, created_at FROM script_keys ORDER BY created_at DESC LIMIT 100"
@@ -3295,9 +3313,9 @@ async def admin_keys_page(request: Request):
 
 @app.post("/admin/keys/create")
 async def admin_keys_create(request: Request, days: int = Form(0), count: int = Form(1), note: str = Form("")):
-    user = get_current_user(request)
-    if not user or user.get("username") != ADMIN_USERNAME:
+    if not is_admin_request(request):
         return HTMLResponse("admin only", status_code=403)
+    user = get_current_user(request) or {"username": ADMIN_USERNAME}
     count = max(1, min(int(count or 1), 50))
     from datetime import timedelta
     conn = get_db()
