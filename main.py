@@ -3209,20 +3209,26 @@ async def api_script_check(request: Request):
     return JSONResponse({"ok": True, "code": "KEY_VALID", "message": "ok"})
 
 
+
 @app.post("/api/script/protect")
 async def api_script_protect(request: Request):
     user = get_current_user(request)
     api_key = request.headers.get("X-API-Key")
-    if (not user or user.get("username") != ADMIN_USERNAME) and api_key:
+    if is_admin_request(request):
+        user = user or {"username": ADMIN_USERNAME}
+    elif api_key:
         user = _user_from_api_key(api_key)
-    if not user or user.get("username") != ADMIN_USERNAME:
+        if not user or user.get("username") != ADMIN_USERNAME:
+            return JSONResponse({"ok": False, "error": "admin only"}, status_code=403)
+    else:
         return JSONResponse({"ok": False, "error": "admin only"}, status_code=403)
     try:
         body = await request.json()
     except Exception:
         body = {}
     code = body.get("code") or ""
-    site_url = (body.get("site_url") or "").rstrip("/")
+    # prefer explicit site_url, else request base URL
+    site_url = (body.get("site_url") or str(request.base_url)).rstrip("/")
     intensity = body.get("intensity") or "medium"
     if not code:
         return JSONResponse({"ok": False, "error": "code required"}, status_code=400)
@@ -3230,36 +3236,50 @@ async def api_script_protect(request: Request):
         protected_body = obfuscate_code(code, intensity, [])
     except Exception:
         protected_body = code
-    # build wrapper without nested f-string hell
+    check_url = site_url + "/api/script/check"
     parts = []
-    parts.append("-- Ruraf protected")
-    parts.append('local script_key = script_key or getgenv().script_key or ""')
+    parts.append("-- Ruraf protected loader")
+    parts.append('local script_key = rawget(_G, "script_key") or (getgenv and getgenv().script_key) or ""')
+    parts.append("assert(type(script_key)=='string' and #script_key>0, 'script_key missing')")
     parts.append("local function _hw()")
     parts.append("  local ok, h = pcall(function()")
-    parts.append("    if gethwid then return gethwid() end")
-    parts.append('    return tostring(game:GetService("Players").LocalPlayer.UserId)')
+    parts.append("    if gethwid then return tostring(gethwid()) end")
+    parts.append("    local p = game:GetService('Players').LocalPlayer")
+    parts.append("    return tostring(p and p.UserId or 0)")
     parts.append("  end)")
-    parts.append('  return ok and h or "unknown"')
+    parts.append("  return ok and tostring(h) or 'unknown'")
+    parts.append("end")
+    parts.append("local function _http(url, body)")
+    parts.append("  local headers = {['Content-Type']='application/json'}")
+    parts.append("  if syn and syn.request then")
+    parts.append("    local r = syn.request({Url=url, Method='POST', Headers=headers, Body=body})")
+    parts.append("    return r.Body or r.body or ''")
+    parts.append("  end")
+    parts.append("  if http_request then")
+    parts.append("    local r = http_request({Url=url, Method='POST', Headers=headers, Body=body})")
+    parts.append("    return r.Body or r.body or ''")
+    parts.append("  end")
+    parts.append("  if request then")
+    parts.append("    local r = request({Url=url, Method='POST', Headers=headers, Body=body})")
+    parts.append("    return r.Body or r.body or ''")
+    parts.append("  end")
+    parts.append("  error('executor has no HTTP request')")
     parts.append("end")
     parts.append("local function _check()")
-    parts.append('  local hs = game:GetService("HttpService")')
-    parts.append('  local url = "' + site_url + '/api/script/check"')
+    parts.append("  local hs = game:GetService('HttpService')")
+    parts.append("  local url = '" + check_url.replace("'", "\\'") + "'")
     parts.append("  local body = hs:JSONEncode({key=script_key, hwid=_hw()})")
-    parts.append("  local res")
-    parts.append("  if syn and syn.request then")
-    parts.append('    res = syn.request({Url=url, Method="POST", Headers={["Content-Type"]="application/json"}, Body=body})')
-    parts.append("  elseif request then")
-    parts.append('    res = request({Url=url, Method="POST", Headers={["Content-Type"]="application/json"}, Body=body})')
-    parts.append("  else error('no http') end")
-    parts.append("  local data = hs:JSONDecode(res.Body or res.body or '{}')")
-    parts.append("  if not data.ok then error(data.message or data.code or 'key invalid') end")
+    parts.append("  local raw = _http(url, body)")
+    parts.append("  local data = hs:JSONDecode(raw)")
+    parts.append("  if type(data)~='table' or not data.ok then")
+    parts.append("    error((data and (data.message or data.code or data.error)) or 'key invalid')")
+    parts.append("  end")
     parts.append("end")
     parts.append("_check()")
     parts.append("-- payload")
     parts.append(protected_body)
     wrapper = "\n".join(parts)
-    return JSONResponse({"ok": True, "result": wrapper})
-
+    return JSONResponse({"ok": True, "result": wrapper, "check_url": check_url})
 
 @app.get("/api/script/stats")
 async def api_script_stats(key: str = ""):
@@ -3275,6 +3295,7 @@ async def api_script_stats(key: str = ""):
     return JSONResponse({"ok": True, "data": dict(row)})
 
 
+
 @app.get("/admin/keys", response_class=HTMLResponse)
 async def admin_keys_page(request: Request):
     if not is_admin_request(request):
@@ -3284,84 +3305,164 @@ async def admin_keys_page(request: Request):
         )
     err = ""
     rows = []
+    api_rows = []
     try:
-        # ensure table exists (old deploys may miss migration)
         conn = get_db()
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS script_keys (
-                    user_key TEXT PRIMARY KEY,
-                    owner_username TEXT NOT NULL,
-                    discord_id TEXT,
-                    hwid TEXT,
-                    note TEXT DEFAULT '',
-                    banned INTEGER DEFAULT 0,
-                    executions INTEGER DEFAULT 0,
-                    created_at TEXT,
-                    expires_at TEXT,
-                    last_hwid_reset TEXT
-                )
-            """)
-            conn.commit()
-        except Exception as e:
-            err += f"create:{e} "
+        for ddl in (
+            """CREATE TABLE IF NOT EXISTS script_keys (
+                user_key TEXT PRIMARY KEY,
+                owner_username TEXT NOT NULL,
+                discord_id TEXT,
+                hwid TEXT,
+                note TEXT DEFAULT '',
+                banned INTEGER DEFAULT 0,
+                executions INTEGER DEFAULT 0,
+                created_at TEXT,
+                expires_at TEXT,
+                last_hwid_reset TEXT
+            )""",
+            """CREATE TABLE IF NOT EXISTS bot_api_keys (
+                api_key TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                label TEXT DEFAULT '',
+                created_at TEXT,
+                last_used TEXT,
+                enabled INTEGER DEFAULT 1
+            )""",
+        ):
+            try:
+                conn.execute(ddl)
+                conn.commit()
+            except Exception as e:
+                err += f"ddl:{e} "
         try:
             rows = conn.execute(
                 "SELECT user_key, discord_id, hwid, executions, banned, expires_at, note, created_at FROM script_keys ORDER BY created_at DESC LIMIT 100"
             ).fetchall() or []
         except Exception as e:
-            err += f"select:{e} "
-            rows = []
+            err += f"script_sel:{e} "
+        try:
+            api_rows = conn.execute(
+                "SELECT api_key, username, label, created_at, last_used, enabled FROM bot_api_keys ORDER BY created_at DESC LIMIT 50"
+            ).fetchall() or []
+        except Exception as e:
+            err += f"api_sel:{e} "
         conn.close()
     except Exception as e:
         err += f"db:{e}"
-        rows = []
 
-    def row_get(r, k, default="-"):
+    def rg(r, k, d="-"):
         try:
             if isinstance(r, dict):
-                return r.get(k, default)
-            # sqlite Row / tuple-like
-            try:
-                return r[k]
-            except Exception:
-                pass
-            return default
+                return r.get(k, d)
+            return r[k]
         except Exception:
-            return default
+            return d
 
-    lis = ""
+    script_lis = ""
     for r in rows:
-        uk = row_get(r, "user_key", "")
-        did = row_get(r, "discord_id", "-") or "-"
-        hw = str(row_get(r, "hwid", "-") or "-")[:12]
-        ex = row_get(r, "executions", 0)
-        bn = row_get(r, "banned", 0)
-        exp = row_get(r, "expires_at", None) or "life"
-        note = row_get(r, "note", "") or ""
-        lis += (
-            "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
-            % (uk, did, hw, ex, "Y" if bn else "N", exp, note)
+        script_lis += "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            rg(r, "user_key", ""),
+            rg(r, "discord_id", "-") or "-",
+            str(rg(r, "hwid", "-") or "-")[:12],
+            rg(r, "executions", 0),
+            "Y" if rg(r, "banned", 0) else "N",
+            rg(r, "expires_at", None) or "life",
+            rg(r, "note", "") or "",
         )
-    err_html = ("<p style='color:#f66'>DB note: %s</p>" % err) if err else ""
-    html = (
-        "<!DOCTYPE html><html><head><meta charset=utf-8><title>Script Keys</title>"
-        "<style>body{font-family:sans-serif;background:#111;color:#eee;padding:24px}"
-        "table{border-collapse:collapse;width:100%}td,th{border:1px solid #333;padding:6px;font-size:12px}"
-        "input,button{padding:8px;margin:4px;background:#222;color:#eee;border:1px solid #444}</style></head><body>"
-        "<h2>Script Keys (Admin)</h2>"
-        + err_html
-        + "<form method=post action='/admin/keys/create'>"
-        "days <input name=days value=0 type=number> "
-        "count <input name=count value=1 type=number> "
-        "note <input name=note> "
-        "<button type=submit>Create keys</button></form>"
-        "<p><a href='/admin' style='color:#9cf'>Admin</a></p>"
-        "<table><tr><th>key</th><th>discord</th><th>hwid</th><th>exec</th><th>ban</th><th>exp</th><th>note</th></tr>"
-        + lis
-        + "</table></body></html>"
-    )
+
+    api_lis = ""
+    for r in api_rows:
+        k = str(rg(r, "api_key", ""))
+        api_lis += "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
+            k,
+            rg(r, "username", ""),
+            rg(r, "label", "") or "",
+            str(rg(r, "created_at", "") or "")[:19],
+            str(rg(r, "last_used", "") or "")[:19],
+            "ON" if rg(r, "enabled", 1) else "OFF",
+        )
+
+    err_html = ("<p style='color:#f66'>DB: %s</p>" % err) if err else ""
+    base = str(request.base_url).rstrip("/")
+    html = f"""<!DOCTYPE html><html><head><meta charset=utf-8><title>Keys</title>
+    <style>
+    body{{font-family:system-ui,sans-serif;background:#0f1115;color:#e8eaed;padding:24px;max-width:1100px;margin:0 auto}}
+    h2{{margin-top:28px}} a{{color:#8ab4f8}}
+    table{{border-collapse:collapse;width:100%;margin-top:8px}}
+    td,th{{border:1px solid #2a2f3a;padding:8px;font-size:12px;text-align:left}}
+    th{{background:#1a1d24}}
+    input,button{{padding:8px 10px;margin:4px 4px 4px 0;background:#1a1d24;color:#eee;border:1px solid #333;border-radius:6px}}
+    button{{background:#3b82f6;border:none;cursor:pointer}}
+    .card{{background:#151821;border:1px solid #2a2f3a;border-radius:12px;padding:16px;margin:12px 0}}
+    code{{font-size:11px}}
+    </style></head><body>
+    <p><a href="/admin">← Admin</a></p>
+    <h1>Ruraf Keys</h1>
+    {err_html}
+    <div class="card">
+      <h2>1) Bot API Key (/ruraf 등록용)</h2>
+      <p>디스코드 봇 <code>/ruraf</code> 에 넣을 키. 사이트 계정에 연결됨.</p>
+      <form method=post action="/admin/keys/create-api">
+        label <input name=label placeholder="discord-bot" value="discord-bot">
+        <button type=submit>Create API Key</button>
+      </form>
+      <table><tr><th>api_key</th><th>user</th><th>label</th><th>created</th><th>last used</th><th>on</th></tr>
+      {api_lis or "<tr><td colspan=6>없음</td></tr>"}
+      </table>
+    </div>
+    <div class="card">
+      <h2>2) Script Keys (Redeem / HWID)</h2>
+      <p>유저 Redeem 용 키. 보호 스크립트 체크 URL: <code>{base}/api/script/check</code></p>
+      <form method=post action="/admin/keys/create">
+        days <input name=days value=0 type=number style="width:80px">
+        count <input name=count value=1 type=number style="width:80px">
+        note <input name=note placeholder="note">
+        <button type=submit>Create Script Keys</button>
+      </form>
+      <table><tr><th>key</th><th>discord</th><th>hwid</th><th>exec</th><th>ban</th><th>exp</th><th>note</th></tr>
+      {script_lis or "<tr><td colspan=7>없음</td></tr>"}
+      </table>
+    </div>
+    </body></html>"""
     return HTMLResponse(html)
+
+
+@app.post("/admin/keys/create-api")
+async def admin_keys_create_api(request: Request, label: str = Form("")):
+    if not is_admin_request(request):
+        return HTMLResponse("admin only", status_code=403)
+    user = get_current_user(request) or {"username": ADMIN_USERNAME}
+    key = "eu_" + secrets.token_urlsafe(24)
+    try:
+        conn = get_db()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_api_keys (
+                    api_key TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    label TEXT DEFAULT '',
+                    created_at TEXT,
+                    last_used TEXT,
+                    enabled INTEGER DEFAULT 1
+                )
+            """)
+            conn.commit()
+        except Exception:
+            pass
+        conn.execute(
+            "INSERT INTO bot_api_keys (api_key, username, label, created_at, enabled) VALUES (?, ?, ?, ?, 1)",
+            (key, user.get("username") or ADMIN_USERNAME, label or "discord-bot", datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return HTMLResponse(f"failed: {e}<p><a href='/admin/keys'>Back</a></p>", status_code=500)
+    return HTMLResponse(
+        f"<h3>API Key created (copy now)</h3><p><code style='font-size:16px'>{key}</code></p>"
+        f"<p>봇에서 <code>/ruraf</code> → 이 키 입력</p>"
+        f"<p><a href='/admin/keys'>Back</a></p>"
+    )
 
 
 @app.post("/admin/keys/create")
@@ -3410,3 +3511,12 @@ async def admin_keys_create(request: Request, days: int = Form(0), count: int = 
         return HTMLResponse(f"create failed: {e}<p><a href='/admin/keys'>Back</a></p>", status_code=500)
     keys_html = "<br>".join("<code>%s</code>" % k for k in created)
     return HTMLResponse("<h3>Created %d</h3>%s<p><a href='/admin/keys'>Back</a></p>" % (len(created), keys_html))
+
+
+@app.get("/api/script/check")
+async def api_script_check_get():
+    return JSONResponse({
+        "ok": False,
+        "error": "Use POST with JSON {key, hwid}",
+        "hint": "Protected scripts call this endpoint via POST"
+    })
