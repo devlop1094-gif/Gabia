@@ -3282,32 +3282,85 @@ async def admin_keys_page(request: Request):
             "<h3>Admin login required</h3><p><a href='/admin'>Admin Login</a> · <a href='/login'>User Login</a></p>",
             status_code=401,
         )
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT user_key, discord_id, hwid, executions, banned, expires_at, note, created_at FROM script_keys ORDER BY created_at DESC LIMIT 100"
-    ).fetchall()
-    conn.close()
+    err = ""
+    rows = []
+    try:
+        # ensure table exists (old deploys may miss migration)
+        conn = get_db()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS script_keys (
+                    user_key TEXT PRIMARY KEY,
+                    owner_username TEXT NOT NULL,
+                    discord_id TEXT,
+                    hwid TEXT,
+                    note TEXT DEFAULT '',
+                    banned INTEGER DEFAULT 0,
+                    executions INTEGER DEFAULT 0,
+                    created_at TEXT,
+                    expires_at TEXT,
+                    last_hwid_reset TEXT
+                )
+            """)
+            conn.commit()
+        except Exception as e:
+            err += f"create:{e} "
+        try:
+            rows = conn.execute(
+                "SELECT user_key, discord_id, hwid, executions, banned, expires_at, note, created_at FROM script_keys ORDER BY created_at DESC LIMIT 100"
+            ).fetchall() or []
+        except Exception as e:
+            err += f"select:{e} "
+            rows = []
+        conn.close()
+    except Exception as e:
+        err += f"db:{e}"
+        rows = []
+
+    def row_get(r, k, default="-"):
+        try:
+            if isinstance(r, dict):
+                return r.get(k, default)
+            # sqlite Row / tuple-like
+            try:
+                return r[k]
+            except Exception:
+                pass
+            return default
+        except Exception:
+            return default
+
     lis = ""
     for r in rows:
-        r = dict(r)
-        lis += "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-            r.get("user_key"), r.get("discord_id") or "-", (r.get("hwid") or "-")[:12],
-            r.get("executions"), "Y" if r.get("banned") else "N", r.get("expires_at") or "life", r.get("note") or ""
+        uk = row_get(r, "user_key", "")
+        did = row_get(r, "discord_id", "-") or "-"
+        hw = str(row_get(r, "hwid", "-") or "-")[:12]
+        ex = row_get(r, "executions", 0)
+        bn = row_get(r, "banned", 0)
+        exp = row_get(r, "expires_at", None) or "life"
+        note = row_get(r, "note", "") or ""
+        lis += (
+            "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+            % (uk, did, hw, ex, "Y" if bn else "N", exp, note)
         )
-    html = """<!DOCTYPE html><html><head><meta charset=utf-8><title>Script Keys</title>
-    <style>body{font-family:sans-serif;background:#111;color:#eee;padding:24px}
-    table{border-collapse:collapse;width:100%}td,th{border:1px solid #333;padding:6px;font-size:12px}
-    input,button{padding:8px;margin:4px}</style></head><body>
-    <h2>Script Keys (Admin only)</h2>
-    <form method=post action="/admin/keys/create">
-      days <input name=days value=0 type=number>
-      count <input name=count value=1 type=number>
-      note <input name=note>
-      <button>Create keys</button>
-    </form>
-    <p><a href="/admin">Admin</a></p>
-    <table><tr><th>key</th><th>discord</th><th>hwid</th><th>exec</th><th>ban</th><th>exp</th><th>note</th></tr>
-    %s</table></body></html>""" % lis
+    err_html = ("<p style='color:#f66'>DB note: %s</p>" % err) if err else ""
+    html = (
+        "<!DOCTYPE html><html><head><meta charset=utf-8><title>Script Keys</title>"
+        "<style>body{font-family:sans-serif;background:#111;color:#eee;padding:24px}"
+        "table{border-collapse:collapse;width:100%}td,th{border:1px solid #333;padding:6px;font-size:12px}"
+        "input,button{padding:8px;margin:4px;background:#222;color:#eee;border:1px solid #444}</style></head><body>"
+        "<h2>Script Keys (Admin)</h2>"
+        + err_html
+        + "<form method=post action='/admin/keys/create'>"
+        "days <input name=days value=0 type=number> "
+        "count <input name=count value=1 type=number> "
+        "note <input name=note> "
+        "<button type=submit>Create keys</button></form>"
+        "<p><a href='/admin' style='color:#9cf'>Admin</a></p>"
+        "<table><tr><th>key</th><th>discord</th><th>hwid</th><th>exec</th><th>ban</th><th>exp</th><th>note</th></tr>"
+        + lis
+        + "</table></body></html>"
+    )
     return HTMLResponse(html)
 
 
@@ -3316,20 +3369,44 @@ async def admin_keys_create(request: Request, days: int = Form(0), count: int = 
     if not is_admin_request(request):
         return HTMLResponse("admin only", status_code=403)
     user = get_current_user(request) or {"username": ADMIN_USERNAME}
-    count = max(1, min(int(count or 1), 50))
+    try:
+        count = max(1, min(int(count or 1), 50))
+        days = max(0, int(days or 0))
+    except Exception:
+        count, days = 1, 0
     from datetime import timedelta
-    conn = get_db()
     created = []
-    for _ in range(count):
-        k = _gen_user_key()
-        exp = (datetime.utcnow() + timedelta(days=days)).isoformat() if days > 0 else None
-        conn.execute(
-            "INSERT INTO script_keys (user_key, owner_username, note, created_at, expires_at, banned, executions) VALUES (?, ?, ?, ?, ?, 0, 0)",
-            (k, user["username"], note or "", datetime.utcnow().isoformat(), exp),
-        )
-        created.append(k)
-    conn.commit()
-    conn.close()
+    try:
+        conn = get_db()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS script_keys (
+                    user_key TEXT PRIMARY KEY,
+                    owner_username TEXT NOT NULL,
+                    discord_id TEXT,
+                    hwid TEXT,
+                    note TEXT DEFAULT '',
+                    banned INTEGER DEFAULT 0,
+                    executions INTEGER DEFAULT 0,
+                    created_at TEXT,
+                    expires_at TEXT,
+                    last_hwid_reset TEXT
+                )
+            """)
+            conn.commit()
+        except Exception:
+            pass
+        for _ in range(count):
+            k = _gen_user_key()
+            exp = (datetime.utcnow() + timedelta(days=days)).isoformat() if days > 0 else None
+            conn.execute(
+                "INSERT INTO script_keys (user_key, owner_username, note, created_at, expires_at, banned, executions) VALUES (?, ?, ?, ?, ?, 0, 0)",
+                (k, user.get("username") or ADMIN_USERNAME, note or "", datetime.utcnow().isoformat(), exp),
+            )
+            created.append(k)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return HTMLResponse(f"create failed: {e}<p><a href='/admin/keys'>Back</a></p>", status_code=500)
     keys_html = "<br>".join("<code>%s</code>" % k for k in created)
     return HTMLResponse("<h3>Created %d</h3>%s<p><a href='/admin/keys'>Back</a></p>" % (len(created), keys_html))
-
