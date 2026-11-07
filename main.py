@@ -26,7 +26,7 @@ import string
 # ======================
 
 APP_NAME = "Euana"
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 
 # Single domain – shop + obfuscation are different paths (no subdomain)
 # SHOP_PATH = /shop   OBF_PATH = /obfuscate
@@ -391,152 +391,30 @@ def rand_name(length: int = 8) -> str:
 
 
 # ======================
-# Obfuscation Engine (AntiLua-style VM)
-# - setmetatable dispatch
-# - mixed hex/binary literals
-# - CF state machine
-# - returns loaded chunk result (fixes nil/null)
+# Obfuscation Engine (Euana native VM)
+# Custom stack bytecode VM + API hiding + stream cipher
 # ======================
 
 def _rand_ident(n: int = 8) -> str:
-    if random.random() < 0.35:
-        return "".join(random.choices(string.ascii_letters, k=n))
-    return "_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
+    if random.random() < 0.5:
+        return "".join(random.choices(string.ascii_lowercase, k=n))
+    return "".join(random.choices(string.ascii_letters, k=n))
 
 
-def _num(n: int, mask32: bool = False) -> str:
-    n = int(n)
-    if mask32:
-        n = n & 0xFFFFFFFF
-    if n < 0:
-        n = n & 0xFFFFFFFF
+def _num(n: int) -> str:
+    n = int(n) & 0xFFFFFFFF
     r = random.random()
-    if 0 <= n < 16 and r < 0.3:
+    if 0 <= n < 10 and r < 0.2:
         return str(n)
-    if r < 0.4:
-        return hex(n)
-    if r < 0.7 and 0 <= n < (1 << 48):
+    if r < 0.55:
+        return "0x" + format(n, "X")
+    if 0 <= n < (1 << 40):
         return "0b" + format(n, "b")
-    return "0x" + format(n, "X")
+    return "0x" + format(n, "x")
 
 
-def _pack_bytes(data: bytes, seed: int) -> list:
-    out = []
-    state = seed & 0xFFFFFFFF
-    i = 0
-    while i < len(data):
-        state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
-        chunk = 0
-        for b in range(4):
-            if i + b < len(data):
-                kb = (state >> (8 * b)) & 0xFF
-                chunk |= ((data[i + b] ^ kb ^ ((i + b) & 0xFF)) & 0xFF) << (8 * b)
-        out.append(chunk & 0xFFFFFFFF)
-        i += 4
-    return out
-
-
-def _split_table(nums: list, size: int = None) -> list:
-    size = size or random.randint(6, 14)
-    return [nums[i:i + size] for i in range(0, len(nums), size)]
-
-
-def _emit_number_table(nums: list) -> str:
-    return "{" + ",".join(_num(x, mask32=True) for x in nums) + "}"
-
-
-def _opaque_true() -> str:
-    a = random.randint(2, 17)
-    b = random.randint(3, 23)
-    forms = [
-        f"(function()local a={_num(a)}return a*a>={_num(0)}end)()",
-        f"(function()local a={_num(a)}return(a+a)==(a*{_num(2)})end)()",
-        f"(function()local a={_num(a)}return not(a*a<{_num(0)})end)()",
-        f"(function()local a={_num(a)}local b={_num(b)}return(a*b)==(b*a)end)()",
-        f"(function()local a={_num(a)}return a==a and a~=nil end)()",
-        f"(function()local a={_num(a)}return(a|{_num(0)})==a end)()",
-    ]
-    return random.choice(forms)
-
-
-def _junk_block() -> str:
-    a, b, c = _rand_ident(4), _rand_ident(4), _rand_ident(5)
-    n1, n2, n3 = random.randint(1, 999), random.randint(1, 999), random.randint(100, 9999)
-    forms = [
-        (
-            f"do local {a}={_num(n1)};local {b}={_num(n2)};"
-            f"if {a}*{a}<{_num(0)} then {b}={b}+{_num(1)} end end"
-        ),
-        (
-            f"do local {a}={_num(n1)};local {b}={_num(n2)};local {c}={_num(n3)};"
-            f"if ({a}+{b})*{c}<{_num(0)} then {c}={c}+{_num(7)} end;"
-            f"{a}={a}~{_num(n1)} end"
-        ),
-        (
-            f"do local {a}={_num(n1)};for {b}=1,{_num(3)} do "
-            f"if {a}*{a}<{_num(0)} then {a}={a}+{_num(1)} end end end"
-        ),
-        (
-            f"do local {a}={_num(n1)};local {b}=({_num(n2)}~{_num(n3)});"
-            f"if type({a})~=\"number\" then {b}={b}+{_num(1)} end end"
-        ),
-    ]
-    return random.choice(forms)
-
-
-def _anti_deobf_junk() -> str:
-    """Extra noise: meaningless numbers, fake checks, dead code for v3."""
-    ids = [_rand_ident(random.randint(5, 9)) for _ in range(6)]
-    nums = [random.randint(0x1000, 0xFFFFFF) for _ in range(8)]
-    a, b, c, d, e, f = ids
-    n0, n1, n2, n3, n4, n5, n6, n7 = nums
-    blocks = [
-        f"local {a}={_num(n0)};local {b}={_num(n1)};local {c}={_num(n2)}",
-        f"if {a}~{_num(n3)}=={_num(0)} and {b}*{b}<{_num(0)} then {c}={c}+{_num(n4)} end",
-        f"local {d}=({_num(n5)}+{_num(n6)})%{_num(n7+1 or 1)};local {e}={_num(n0)}^0",
-        f"if type({d})==\"number\" and {e}=={_num(1)} then {f}={_num(n1)} else {f}={_num(n2)} end",
-        f"do local _{_rand_ident(3)}={_num(random.randint(10,9999))} end",
-    ]
-    random.shuffle(blocks)
-    return ";".join(blocks)
-
-
-def _b85_alphabet() -> str:
-    return (
-        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-        "!#$%&()*+./:;<=>?@[]^_{|}~"
-    )
-
-
-def _encode_payload(data: bytes, key: bytes):
-    alphabet_list = list(_b85_alphabet())
-    random.shuffle(alphabet_list)
-    alphabet = "".join(alphabet_list)
-    base = len(alphabet)
-
-    out = bytearray(len(data))
-    for i, b in enumerate(data):
-        out[i] = b ^ key[i % len(key)] ^ ((i * 131) & 0xFF)
-
-    pad = (4 - (len(out) % 4)) % 4
-    out = out + bytes(pad)
-    encoded = []
-    i = 0
-    while i < len(out):
-        n = out[i] | (out[i + 1] << 8) | (out[i + 2] << 16) | (out[i + 3] << 24)
-        i += 4
-        for _ in range(5):
-            encoded.append(alphabet[n % base])
-            n //= base
-    payload = "LPH" + "".join(encoded)
-
-    used = list(sorted(set(payload)))
-    vals = used[:]
-    random.shuffle(vals)
-    sub = {used[i]: vals[i] for i in range(len(used))}
-    scrambled = "".join(sub[c] for c in payload)
-    inv = {v: k for k, v in sub.items()}
-    return scrambled, inv, alphabet, pad
+def _char_array(s: str) -> str:
+    return ",".join(str(ord(c)) for c in s)
 
 
 def _rename_vars(src: str) -> str:
@@ -553,7 +431,7 @@ def _rename_vars(src: str) -> str:
     mapping = {}
 
     def new_name():
-        return _rand_ident(random.randint(6, 10))
+        return _rand_ident(random.randint(5, 9))
 
     def ren_func(m):
         prefix, name = m.group(1), m.group(2)
@@ -595,124 +473,218 @@ def _rename_vars(src: str) -> str:
     return src
 
 
-def _emit_vm(src: str, intensity: str) -> str:
-    """VM envelope: setmetatable + payload + submap + numeric slots."""
+def _stream_crypt(data: bytes, seed: int) -> bytes:
+    state = seed & 0xFFFFFFFF
+    out = bytearray(len(data))
+    for i, b in enumerate(data):
+        state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
+        k = (state >> 16) & 0xFF
+        out[i] = b ^ k ^ ((i * 131) & 0xFF)
+    return bytes(out)
+
+
+def _b85_encode(data: bytes, alphabet: str) -> tuple:
+    base = len(alphabet)
+    pad = (4 - (len(data) % 4)) % 4
+    data = data + bytes(pad)
+    out = []
+    i = 0
+    while i < len(data):
+        n = data[i] | (data[i + 1] << 8) | (data[i + 2] << 16) | (data[i + 3] << 24)
+        i += 4
+        for _ in range(5):
+            out.append(alphabet[n % base])
+            n //= base
+    return "".join(out), pad
+
+
+def _emit_vm_bytecode(src: str, intensity: str) -> str:
+    """Professional-style stack VM envelope with API hiding."""
+    # --- random identifiers ---
+    N = {k: _rand_ident(random.randint(3, 4)) for k in (
+        "rg", "env", "bxor", "band", "rshift", "char", "sub", "concat",
+        "floor", "pack", "unpack", "pcall", "type", "error", "setmt",
+        "rawget", "load", "mt", "dec", "vm", "st", "sp", "pc", "bc", "kn",
+        "push", "pop", "run",
+    )}
+
+    seed = random.randint(1, 0x7FFFFFFF)
     raw = src.encode("utf-8")
-    key = bytes(random.randint(0, 255) for _ in range(16))
-    scrambled, inv, alphabet, pad = _encode_payload(raw, key)
+    encrypted = _stream_crypt(raw, seed)
 
-    parts = []
-    for k, v in inv.items():
-        ks = k.replace("\\", "\\\\").replace('"', '\\"')
-        vs = v.replace("\\", "\\\\").replace('"', '\\"')
-        parts.append(f'["{ks}"]="{vs}"')
-    random.shuffle(parts)
-    submap_lua = "{" + ",".join(parts) + "}"
-
-    slots = list(range(12, 140))
-    random.shuffle(slots)
-    (
-        s_char, s_gsub, s_concat, s_bxor, s_floor, s_type,
-        s_payload, s_submap, s_key, s_len, s_alpha, s_pad,
-        s_dec, s_run, s_boot
-    ) = slots[:15]
-
-    entry = random.choice(["N", "B", "R", "X", "K", "Z", "Q", "M", "W", "Y"])
-    ot = _opaque_true()
-    junk = _junk_block()
-    extra_junk = _anti_deobf_junk() if intensity == "v3" else ""
-    key_tbl = "{" + ",".join(_num(b) for b in key) + "}"
+    alphabet_list = list(
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        "!#$%&()*+./:;<=>?@[]^_{|}~"
+    )
+    random.shuffle(alphabet_list)
+    alphabet = "".join(alphabet_list)
+    encoded, pad = _b85_encode(encrypted, alphabet)
 
     eq = "="
-    while f"]{eq}]" in scrambled:
+    while f"]{eq}]" in encoded:
         eq += "="
-    payload_lit = f"[{eq}[{scrambled}]{eq}]"
+    payload_lit = f"[{eq}[{encoded}]{eq}]"
     alpha_esc = alphabet.replace("\\", "\\\\").replace('"', '\\"')
 
-    body = f"""return setmetatable({{
-[{_num(s_char)}]=string.char,
-[{_num(s_gsub)}]=string.gsub,
-[{_num(s_concat)}]=table.concat,
-[{_num(s_floor)}]=math.floor,
-[{_num(s_type)}]=type,
-[{_num(s_payload)}]={payload_lit},
-[{_num(s_submap)}]={submap_lua},
-[{_num(s_key)}]={key_tbl},
-[{_num(s_len)}]={_num(len(raw))},
-[{_num(s_alpha)}]="{alpha_esc}",
-[{_num(s_pad)}]={_num(pad)},
-[{_num(s_bxor)}]=function(self,x,y)
-x=self[{_num(s_floor)}](x)%{_num(256)};y=self[{_num(s_floor)}](y)%{_num(256)}
-local r,p={_num(0)},{_num(1)}
-for _=1,{_num(8)} do
-local bx,by=x%{_num(2)},y%{_num(2)}
-r=r+((bx+by)%{_num(2)})*p
-x=self[{_num(s_floor)}](x/{_num(2)});y=self[{_num(s_floor)}](y/{_num(2)});p=p*{_num(2)}
+    # randomized opcodes
+    OP = {
+        "DECODE": random.randint(0x10, 0x50),
+        "GETLOAD": random.randint(0x51, 0x90),
+        "CALL1": random.randint(0x91, 0xC0),
+        "CALL0": random.randint(0xC1, 0xF0),
+        "RETURN": random.randint(0xF1, 0x120),
+        "NOP": random.randint(0x121, 0x150),
+        "JUNK": random.randint(0x151, 0x180),
+        "HALT": random.randint(0x181, 0x1B0),
+    }
+
+    # bytecode with noise nops for v2/v3
+    program = []
+    def emit(*args):
+        program.extend(args)
+
+    noise_n = {"v1": 2, "v2": 6, "v3": 14}.get(intensity, 6)
+    for _ in range(noise_n // 2):
+        emit(OP["NOP"])
+        emit(OP["JUNK"], random.randint(1, 9999))
+
+    emit(OP["DECODE"])          # -> push decrypted source
+    emit(OP["GETLOAD"])         # -> push load
+    # stack: [src, load]  -- need load below src for call
+    # actually after DECODE: [src], after GETLOAD: [src, load]
+    # CALL1 expects (load, src) so swap via two moves or just fix order:
+    # GETLOAD first then DECODE: [load, src]
+    program.clear()
+    for _ in range(noise_n // 2):
+        emit(OP["NOP"])
+        emit(OP["JUNK"], random.randint(1, 9999))
+    emit(OP["GETLOAD"])
+    for _ in range(noise_n // 2):
+        emit(OP["NOP"])
+    emit(OP["DECODE"])
+    emit(OP["CALL1"])           # fn = load(src); push fn
+    emit(OP["CALL0"])           # fn(...)
+    emit(OP["RETURN"])
+    emit(OP["HALT"])
+
+    bc_lua = "{" + ",".join(_num(x) for x in program) + "}"
+
+    # pure-lua xor (no bit32 required)
+    # bxor via arithmetic
+    xor_fn = f"""
+local function {N['bxor']}(a,b)
+a={N['floor']}(a)%256;b={N['floor']}(b)%256
+local r,p=0,1
+for _=1,8 do
+local ba=a%2;local bb=b%2
+r=r+((ba+bb)%2)*p
+a={N['floor']}(a/2);b={N['floor']}(b/2);p=p*2
 end
 return r
-end,
-[{_num(s_dec)}]=function(self)
-local S=self[{_num(s_payload)}]
-local M=self[{_num(s_submap)}]
-local A=self[{_num(s_alpha)}]
-local K=self[{_num(s_key)}]
-local L=self[{_num(s_len)}]
-local base=#A
-local idx={{}}
-for i=1,base do idx[A:sub(i,i)]=i-1 end
-local plain=self[{_num(s_gsub)}](S,".",function(c)return M[c] or c end)
-if plain:sub(1,3)~="LPH" then error("LPH") end
-plain=plain:sub(4)
-local digits={{}}
-for i=1,#plain do
-digits[#digits+1]=idx[plain:sub(i,i)]
 end
+"""
+
+    body = f"""
+local {N['rg']}=rawget
+local {N['env']}={N['rg']}(_G,string.char({_char_array('_G')})) or _G
+local {N['char']}={N['rg']}({N['rg']}({N['env']},string.char({_char_array('string')})),string.char({_char_array('char')}))
+local {N['sub']}={N['rg']}({N['rg']}({N['env']},string.char({_char_array('string')})),string.char({_char_array('sub')}))
+local {N['concat']}={N['rg']}({N['rg']}({N['env']},string.char({_char_array('table')})),string.char({_char_array('concat')}))
+local {N['floor']}={N['rg']}({N['rg']}({N['env']},string.char({_char_array('math')})),string.char({_char_array('floor')}))
+local {N['pack']}={N['rg']}({N['rg']}({N['env']},string.char({_char_array('table')})),string.char({_char_array('pack')}))
+local {N['unpack']}={N['rg']}({N['rg']}({N['env']},string.char({_char_array('table')})),string.char({_char_array('unpack')})) or unpack
+local {N['pcall']}={N['rg']}({N['env']},string.char({_char_array('pcall')}))
+local {N['type']}={N['rg']}({N['env']},string.char({_char_array('type')}))
+local {N['error']}={N['rg']}({N['env']},string.char({_char_array('error')}))
+local {N['setmt']}={N['rg']}({N['env']},string.char({_char_array('setmetatable')}))
+local {N['rawget']}={N['rg']}({N['env']},string.char({_char_array('rawget')}))
+local {N['load']}={N['rg']}({N['env']},string.char({_char_array('load')})) or {N['rg']}({N['env']},string.char({_char_array('loadstring')}))
+{xor_fn}
+local {N['mt']}={{}}
+{N['mt']}.__index=function(t,k)
+if k=={N['char']}({_char_array('debug')}) then return nil end
+return {N['rawget']}(t,k)
+end
+{N['pcall']}({N['setmt']},_G,{N['mt']})
+local function {N['dec']}(blob,alpha,seed,len)
+local base=#alpha
+local idx={{}}
+for i=1,base do idx[{N['sub']}(alpha,i,i)]=i-1 end
+local digits={{}}
+for i=1,#blob do digits[#digits+1]=idx[{N['sub']}(blob,i,i)] end
 local bytes={{}}
 local di=1
 while di+4<=#digits do
-local n={_num(0)}
-local p={_num(1)}
+local n=0
+local p=1
 for j=0,4 do
 n=n+(digits[di+j] or 0)*p
 p=p*base
 end
 di=di+5
 for j=0,3 do
-bytes[#bytes+1]=n%{_num(256)}
-n=self[{_num(s_floor)}](n/{_num(256)})
+bytes[#bytes+1]=n%256
+n={N['floor']}(n/256)
 end
 end
+local state=seed
 local out={{}}
-for i=1,L do
-local kb=K[((i-1)%#K)+1]
-local xb=self[{_num(s_bxor)}](self,bytes[i],kb)
-out[i]=self[{_num(s_char)}](self[{_num(s_bxor)}](self,xb,(i-1)*{_num(131)}))
+for i=1,len do
+state=(state*1664525+1013904223)%4294967296
+local k={N['floor']}(state/65536)%256
+local xb={N['bxor']}(bytes[i],k)
+out[i]={N['char']}({N['bxor']}(xb,((i-1)*131)%256))
 end
-return self[{_num(s_concat)}](out)
-end,
-[{_num(s_run)}]=function(self,...)
-{junk}
-{extra_junk}
-local src=self[{_num(s_dec)}](self)
-local loader=load or loadstring
-local fn,err=loader(src)
-if not fn then error(err or "load") end
-if {ot} then return fn(...) end
-return fn(...)
-end,
-[{_num(s_boot)}]=function(self,...)
-return self[{_num(s_run)}](self,...)
-end,
-["{entry}"]=function(self,...)
-return self[{_num(s_boot)}](self,...)
+return {N['concat']}(out)
 end
-}},{{__index=function(t,k)return rawget(t,k)end}}):{entry}(...)"""
-
-    if intensity in ("v2", "v3"):
-        body = " ".join(body.split())
-    else:
-        body = "\n".join(ln.rstrip() for ln in body.splitlines() if ln.strip())
-    return body
+local {N['kn']}={{}}
+{N['kn']}[1]={payload_lit}
+{N['kn']}[2]="{alpha_esc}"
+{N['kn']}[3]={_num(seed)}
+{N['kn']}[4]={_num(len(raw))}
+local {N['bc']}={bc_lua}
+local function {N['vm']}(...)
+local {N['st']}={{}}
+local {N['sp']}=0
+local {N['pc']}=1
+local function {N['push']}(v) {N['sp']}={N['sp']}+1 {N['st']}[{N['sp']}]=v end
+local function {N['pop']}() local v={N['st']}[{N['sp']}] {N['sp']}={N['sp']}-1 return v end
+while {N['pc']}<=#{N['bc']} do
+local op={N['bc']}[{N['pc']}]
+{N['pc']}={N['pc']}+1
+if op=={_num(OP['GETLOAD'])} then
+{N['push']}({N['load']})
+elseif op=={_num(OP['DECODE'])} then
+local src={N['dec']}({N['kn']}[1],{N['kn']}[2],{N['kn']}[3],{N['kn']}[4])
+{N['push']}(src)
+elseif op=={_num(OP['CALL1'])} then
+local src={N['pop']}()
+local ldr={N['pop']}()
+local fn,err=ldr(src)
+if not fn then {N['error']}(err or {N['char']}({_char_array('load')})) end
+{N['push']}(fn)
+elseif op=={_num(OP['CALL0'])} then
+local fn={N['pop']}()
+fn(...)
+elseif op=={_num(OP['RETURN'])} then
+return
+elseif op=={_num(OP['NOP'])} then
+local _={_num(random.randint(0, 0xFF))}
+elseif op=={_num(OP['JUNK'])} then
+local _j={N['bc']}[{N['pc']}];{N['pc']}={N['pc']}+1
+local _x=_j*0+_j
+elseif op=={_num(OP['HALT'])} then
+break
+else
+local _d={_num(random.randint(1, 99))}
+end
+end
+end
+return {N['vm']}(...)
+"""
+    body = re.sub(r"[ \t]+\n", "\n", body)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    return body.strip()
 
 
 def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
@@ -720,7 +692,8 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     if not code:
         return "-- empty"
     if intensity not in ("v1", "v2", "v3"):
-        intensity = "v2"
+        intensity = "v3"
+
     cleaned = []
     for line in code.splitlines():
         if line.strip().startswith("--"):
@@ -732,20 +705,13 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
 
     renamed = _rename_vars(src)
 
-    # Layer counts by intensity
-    # v1: 2 layers, v2: 4 layers, v3: 6 layers + anti-deobf junk
-    layer_map = {"v1": 2, "v2": 4, "v3": 6}
-    n_layers = layer_map.get(intensity, 4)
+    # v1=1 VM, v2=2 nested VMs, v3=3 nested VMs (each is full bytecode VM)
+    layer_map = {"v1": 1, "v2": 2, "v3": 3}
+    n_layers = layer_map.get(intensity, 3)
 
     current = renamed
-    for i in range(n_layers):
-        # v3 forces v3 intensity on every layer for extra junk;
-        # otherwise alternate so each envelope differs
-        if intensity == "v3":
-            layer_intensity = "v3"
-        else:
-            layer_intensity = "v2" if (intensity == "v2" or i % 2 == 1) else "v1"
-        current = _emit_vm(current, layer_intensity)
+    for _ in range(n_layers):
+        current = _emit_vm_bytecode(current, intensity)
 
     nl = chr(10)
     out = (
@@ -753,14 +719,7 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
         + f"-- {datetime.utcnow().strftime('%Y-%m-%d')} | {intensity}" + nl
         + current
     )
-    lines = []
-    for ln in out.splitlines():
-        low = ln.lower()
-        if "luraph" in low or "multi-layer" in low or "5-layer" in low:
-            continue
-        lines.append(ln)
-    return nl.join(lines) + nl
-
+    return out + nl
 
 
 def calc_cost(intensity: str, options: List[str] = None) -> int:
@@ -1228,7 +1187,7 @@ async def dashboard(request: Request, lang: str = "en", result_id: str = None, e
             <select name="intensity">
                 <option value="v1">Euana v1 (standard)</option>
                 <option value="v2">Euana v2 (upgraded + VM)</option>
-                <option value="v3" selected>Euana v3 (6-layer + anti-deobf)</option>
+                <option value="v3" selected>Euana v3 (max protection)</option>
             </select>
             <label>Code</label>
             <textarea name="code" placeholder="Paste Luau / Lua code here (optional if you upload a file)"></textarea>
