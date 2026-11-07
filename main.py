@@ -1,12 +1,4 @@
 """
-Euana - Single File (Render Ready)
-- Register / Login
-- Bank transfer / Crypto payment
-- Credit system
-- Server-side obfuscation + dashboard result
-- Multiple obfuscation options
-"""
-
 from fastapi import FastAPI, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -391,8 +383,11 @@ def rand_name(length: int = 8) -> str:
 
 
 # ======================
-# Obfuscation Engine (Euana Bytecode VM)
-# Real custom bytecode – no recoverable source string via load()
+# Obfuscation Engine (Euana Custom Bytecode VM)
+# Inner custom bytecode VM + outer nested VM envelopes (always).
+# Encoding: modular addition + LCG (NO XOR).
+# Anti function-escape / variable-escape: debug neutered, getfenv/setfenv blocked, _G guarded.
+# Fallback splits source into many fragments so no contiguous original source exists.
 # ======================
 
 # ---- ISA ----
@@ -1077,11 +1072,13 @@ def _compile_source(src: str):
 
 
 def _encode_bc(data: bytes, key: bytes):
+    """Mix bytes with LCG keystream + key using modular addition (no XOR)."""
     out = bytearray(len(data))
     state = int.from_bytes(key[:4].ljust(4, b"\0"), "little") or 1
     for i, b in enumerate(data):
         state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
-        out[i] = b ^ key[i % len(key)] ^ ((state >> 16) & 0xFF) ^ ((i * 131) & 0xFF)
+        k = (state >> 16) & 0xFF
+        out[i] = (b + key[i % len(key)] + k + ((i * 131) & 0xFF)) & 0xFF
     return bytes(out)
 
 
@@ -1135,7 +1132,7 @@ def _emit_vm_runtime(blob_b85: str, alph: str, pad: int, key: bytes, op: dict, i
     N = {k: _rand_ident() for k in (
         "rg", "env", "char", "sub", "concat", "floor", "pack", "unpack",
         "pcall", "type", "error", "setmt", "rawget", "rawset", "tostring",
-        "tonumber", "select", "bxor", "dec", "vm", "st", "sp", "pc", "bc",
+        "tonumber", "select", "dec", "vm", "st", "sp", "pc", "bc",
         "kn", "locals", "run", "decode", "K", "code", "mt",
     )}
 
@@ -1149,14 +1146,55 @@ def _emit_vm_runtime(blob_b85: str, alph: str, pad: int, key: bytes, op: dict, i
     # randomized op numbers as locals
     op_locals = "\n".join(f"local OP_{k} = {_num(v)}" for k, v in op.items())
 
-    anti = ""
-    if intensity in ("v2", "v3"):
-        anti = f"""
+    # Always-on anti escape / anti dump / anti hook (function + variable escape)
+    anti = f"""
 do
-local _t = type
-if _t(_t) ~= "function" then while true do end end
-if _t(setmetatable) ~= "function" then while true do end end
-if _t(string.char) ~= "function" then while true do end end
+  local _t = type
+  local _p = pcall
+  local _rg = rawget
+  local _rs = rawset
+  local _Gref = _G
+  -- basic integrity
+  if _t(_t) ~= "function" then while true do end end
+  if _t(setmetatable) ~= "function" then while true do end end
+  if _t(string) ~= "table" or _t(string.char) ~= "function" then while true do end end
+  -- kill / neuter debug library (function escape via debug.getinfo / getupvalue / getlocal)
+  local dbg = _rg(_Gref, "debug")
+  if _t(dbg) == "table" then
+    local empty = function() end
+    for _,k in pairs({{"getinfo","getupvalue","setupvalue","getlocal","setlocal","getregistry","traceback","sethook","gethook","getfenv","setfenv"}}) do
+      _p(function() _rs(dbg, k, empty) end)
+    end
+    _p(function() _rs(_Gref, "debug", nil) end)
+  end
+  -- block common env escape (Lua 5.1 style)
+  _p(function()
+    if getfenv then
+      local gf = getfenv
+      getfenv = function(f)
+        if f == 0 or f == 1 then return {{}} end
+        return gf(f)
+      end
+    end
+    if setfenv then
+      setfenv = function() end
+    end
+  end)
+  -- prevent easy global dump / variable escape
+  _p(function()
+    local mt = getmetatable(_Gref)
+    if not mt then
+      mt = {{}}
+      setmetatable(_Gref, mt)
+    end
+    local old_index = mt.__index
+    mt.__index = function(t, k)
+      if k == "debug" or k == "getfenv" or k == "setfenv" then return nil end
+      if _t(old_index) == "function" then return old_index(t, k) end
+      if _t(old_index) == "table" then return old_index[k] end
+      return rawget(t, k)
+    end
+  end)
 end
 """
 
@@ -1179,16 +1217,6 @@ local {N['tostring']} = {N['rg']}({N['env']}, string.char({_char_arr('tostring')
 local {N['tonumber']} = {N['rg']}({N['env']}, string.char({_char_arr('tonumber')}))
 local {N['select']} = {N['rg']}({N['env']}, string.char({_char_arr('select')}))
 {anti}
-local function {N['bxor']}(a, b)
-  a = {N['floor']}(a) % 256; b = {N['floor']}(b) % 256
-  local r, p = 0, 1
-  for _ = 1, 8 do
-    local ba, bb = a % 2, b % 2
-    r = r + ((ba + bb) % 2) * p
-    a = {N['floor']}(a / 2); b = {N['floor']}(b / 2); p = p * 2
-  end
-  return r
-end
 local function {N['decode']}(blob, alpha, key, pad)
   local base = #alpha
   local idx = {{}}
@@ -1210,7 +1238,9 @@ local function {N['decode']}(blob, alpha, key, pad)
   for i = 1, #bytes do
     state = (state * 1664525 + 1013904223) % 4294967296
     local k = {N['floor']}(state / 65536) % 256
-    out[i] = {N['bxor']}({N['bxor']}(bytes[i], key[((i - 1) % #key) + 1]), {N['bxor']}(k, (i - 1) * 131 % 256))
+    -- modular subtraction (no XOR)
+    local v = bytes[i] - key[((i - 1) % #key) + 1] - k - ((i - 1) * 131 % 256)
+    out[i] = (v % 256 + 256) % 256
   end
   return out
 end
@@ -1369,24 +1399,41 @@ return {N['vm']}(...)
 
 
 def _fallback_string_vm(src: str, intensity: str) -> str:
-    """If compile fails, still use encrypted bytecode of source as DATA only,
-    but reconstruct via VM ops char-by-char style is too heavy; use load as last resort
-    inside VM with heavy anti – marked as weak path."""
-    # Pack source as a single string constant + tiny program LOADK CALL load
-    # This path is weaker but keeps output working for complex scripts.
+    """Last-resort path when full bytecode compile fails.
+    Source is split into many small encrypted fragments and only concatenated
+    at the last moment inside pcall so static recovery of one contiguous
+    original source string is harder. Still weaker than true BC-VM.
+    Encoding uses modular addition (no XOR)."""
     key = bytes(random.randint(0, 255) for _ in range(16))
     raw = src.encode("utf-8")
-    # fake "bytecode" that is just encrypted source with a header flag
-    blob = b"FALL" + raw
-    enc = _encode_bc(blob, key)
-    b85, alph, pad = _b85(enc)
-    N = {k: _rand_ident() for k in ("dec", "bxor", "floor", "char", "sub", "concat", "rg", "env", "load", "run")}
-    key_tbl = "{" + ",".join(str(b) for b in key) + "}"
-    eq = "="
-    while f"]{eq}]" in b85:
-        eq += "="
-    payload = f"[{eq}[{b85}]{eq}]"
-    alph_esc = alph.replace("\\", "\\\\").replace('"', '\\"')
+    # Split into random-sized chunks so no single constant holds the whole source
+    chunks = []
+    i = 0
+    while i < len(raw):
+        sz = random.randint(8, 48)
+        chunks.append(raw[i:i+sz])
+        i += sz
+    # Encode each chunk separately with different derived keys
+    encoded_parts = []
+    for ci, ch in enumerate(chunks):
+        ck = bytes((key[j] + ci * 17 + j) & 0xFF for j in range(len(key)))
+        enc = _encode_bc(ch, ck)
+        b85, alph, pad = _b85(enc)
+        encoded_parts.append((b85, alph, pad, ck))
+    N = {k: _rand_ident() for k in ("dec", "floor", "char", "sub", "concat", "rg", "env", "load", "run", "parts")}
+    # Build the Lua that decodes each part then joins
+    parts_code = []
+    for idx, (b85, alph, pad, ck) in enumerate(encoded_parts):
+        eq = "="
+        while f"]{eq}]" in b85:
+            eq += "="
+        payload = f"[{eq}[{b85}]{eq}]"
+        alph_esc = alph.replace("\\", "\\\\").replace('"', '\\"')
+        key_tbl = "{" + ",".join(str(b) for b in ck) + "}"
+        parts_code.append(
+            f'{{blob={payload},alpha="{alph_esc}",key={key_tbl},pad={_num(pad)}}}'
+        )
+    parts_lua = "{" + ",".join(parts_code) + "}"
     return f"""
 local {N['rg']}=rawget
 local {N['env']}={N['rg']}(_G,string.char({_char_arr('_G')})) or _G
@@ -1395,11 +1442,22 @@ local {N['char']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('string'
 local {N['sub']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('sub')}))
 local {N['concat']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('table')})),string.char({_char_arr('concat')}))
 local {N['load']}={N['rg']}({N['env']},string.char({_char_arr('load')})) or {N['rg']}({N['env']},string.char({_char_arr('loadstring')}))
-local function {N['bxor']}(a,b)
-a={N['floor']}(a)%256;b={N['floor']}(b)%256
-local r,p=0,1
-for _=1,8 do local ba,bb=a%2,b%2;r=r+((ba+bb)%2)*p;a={N['floor']}(a/2);b={N['floor']}(b/2);p=p*2 end
-return r end
+do
+  local _t=type;local _p=pcall;local _rg=rawget;local _rs=rawset;local _Gref=_G
+  if _t(_t)~="function" then while true do end end
+  local dbg=_rg(_Gref,"debug")
+  if _t(dbg)=="table" then
+    local empty=function() end
+    for _,k in pairs({{"getinfo","getupvalue","setupvalue","getlocal","setlocal","getregistry","traceback","sethook","gethook","getfenv","setfenv"}}) do
+      _p(function() _rs(dbg,k,empty) end)
+    end
+    _p(function() _rs(_Gref,"debug",nil) end)
+  end
+  _p(function()
+    if getfenv then getfenv=function(f) if f==0 or f==1 then return {{}} end return getfenv(f) end end
+    if setfenv then setfenv=function() end end
+  end)
+end
 local function {N['dec']}(blob,alpha,key,pad)
 local base=#alpha;local idx={{}};for i=1,base do idx[{N['sub']}(alpha,i,i)]=i-1 end
 local digits={{}};for i=1,#blob do digits[#digits+1]=idx[{N['sub']}(blob,i,i)] end
@@ -1414,18 +1472,25 @@ local out={{}}
 for i=1,#bytes do
 state=(state*1664525+1013904223)%4294967296
 local k={N['floor']}(state/65536)%256
-out[i]={N['bxor']}({N['bxor']}(bytes[i],key[((i-1)%#key)+1]),{N['bxor']}(k,(i-1)*131%256))
+local v=bytes[i]-key[((i-1)%#key)+1]-k-((i-1)*131%256)
+out[i]=(v%256+256)%256
 end
 return out
 end
-local KEY={key_tbl}
-local bytes={N['dec']}({payload},"{alph_esc}",KEY,{_num(pad)})
-local chars={{}};for i=5,#bytes do chars[#chars+1]={N['char']}(bytes[i]) end
+local {N['parts']}={parts_lua}
+local chars={{}}
+for pi=1,#{N['parts']} do
+  local p={N['parts']}[pi]
+  local bytes={N['dec']}(p.blob,p.alpha,p.key,p.pad)
+  for i=1,#bytes do chars[#chars+1]={N['char']}(bytes[i]) end
+end
 local src={N['concat']}(chars)
 local fn,err={N['load']}(src)
 if not fn then error(err or "load") end
 return fn(...)
 """
+
+
 
 
 def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
@@ -1444,11 +1509,10 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     if not src.strip():
         src = code
 
-    # Try real bytecode compilation
+    # Try real bytecode compilation (inner VM)
     bc, constants, op, ok = _compile_source(src)
 
-    layers = {"v1": 1, "v2": 2, "v3": 3}.get(intensity, 2)
-
+    # Always produce inner custom bytecode VM when possible
     if ok and len(bc) > 2:
         key = bytes(random.randint(0, 255) for _ in range(16))
         packed = _pack_program(bc, constants)
@@ -1456,18 +1520,18 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
         b85, alph, pad = _b85(enc)
         current = _emit_vm_runtime(b85, alph, pad, key, op, intensity)
     else:
-        # complex script: fallback path
+        # complex script: fallback path (still fragmented, no single source blob)
         current = _fallback_string_vm(src, intensity)
 
-    # Outer layers: wrap the whole VM source as nested encrypted VMs (string VM envelope)
-    # This adds size + anti-analysis without changing the fact inner is bytecode when ok
-    for _ in range(max(0, layers - 1)):
+    # Outer VM layers: always at least 1 outer envelope, more for higher intensity
+    # v1 = 1 outer, v2 = 2 outer, v3 = 3 outer  → total nested VMs
+    outer_layers = {"v1": 1, "v2": 2, "v3": 3}.get(intensity, 2)
+    for _ in range(outer_layers):
         current = _fallback_string_vm(current, intensity)
 
     nl = chr(10)
     return (
         f"-- Protected by {APP_NAME} {VERSION}" + nl
-        + f"-- {datetime.utcnow().strftime('%Y-%m-%d')} | {intensity} | BC-VM" + nl
         + current + nl
     )
 
@@ -2797,5 +2861,4 @@ if __name__ == "__main__":
     print(f"{APP_NAME} Obfuscator v{VERSION}")
     print(f"Listening on port {port}")
     print(f"Admin: /admin  (user={ADMIN_USERNAME} / pass={ADMIN_PASSWORD})")
-    print(f"DB: PostgreSQL (DATABASE_URL set={bool(DATABASE_URL)})")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    print
