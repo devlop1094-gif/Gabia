@@ -1,3 +1,12 @@
+"""
+Euana - Single File (Render Ready)
+- Register / Login
+- Bank transfer / Crypto payment
+- Credit system
+- Server-side obfuscation + dashboard result
+- Multiple obfuscation options
+"""
+
 from fastapi import FastAPI, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -1397,30 +1406,88 @@ return {N['vm']}(...)
     return body.strip()
 
 
-def _fallback_string_vm(src: str, intensity: str) -> str:
-    """Last-resort path when full bytecode compile fails.
-    Source is split into many small encrypted fragments and only concatenated
-    at the last moment inside pcall so static recovery of one contiguous
-    original source string is harder. Still weaker than true BC-VM.
-    Encoding uses modular addition (no XOR)."""
+def _fast_outer_vm(src: str, intensity: str) -> str:
+    """Fast single-blob outer envelope. Used for nesting layers.
+    Much faster than multi-chunk path – one encode + one b85 only."""
     key = bytes(random.randint(0, 255) for _ in range(16))
     raw = src.encode("utf-8")
-    # Split into random-sized chunks so no single constant holds the whole source
+    enc = _encode_bc(raw, key)
+    b85, alph, pad = _b85(enc)
+    N = {k: _rand_ident() for k in ("dec", "floor", "char", "sub", "concat", "rg", "env", "load")}
+    eq = "="
+    while f"]{eq}]" in b85:
+        eq += "="
+    payload = f"[{eq}[{b85}]{eq}]"
+    alph_esc = alph.replace("\\", "\\\\").replace('"', '\\"')
+    key_tbl = "{" + ",".join(str(b) for b in key) + "}"
+    # compact anti (same protection, less code)
+    anti = """
+do local _t=type;local _p=pcall;local _rg=rawget;local _rs=rawset;local _Gref=_G
+if _t(_t)~="function" then while true do end end
+local dbg=_rg(_Gref,"debug")
+if _t(dbg)=="table" then local e=function()end
+for _,k in pairs({"getinfo","getupvalue","setupvalue","getlocal","setlocal","getregistry","traceback","sethook","gethook","getfenv","setfenv"}) do _p(function()_rs(dbg,k,e)end) end
+_p(function()_rs(_Gref,"debug",nil)end) end
+_p(function() if getfenv then getfenv=function(f)if f==0 or f==1 then return {} end return getfenv(f) end end if setfenv then setfenv=function()end end end)
+end
+"""
+    return f"""
+local {N['rg']}=rawget
+local {N['env']}={N['rg']}(_G,string.char({_char_arr('_G')})) or _G
+local {N['floor']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('math')})),string.char({_char_arr('floor')}))
+local {N['char']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('char')}))
+local {N['sub']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('sub')}))
+local {N['concat']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('table')})),string.char({_char_arr('concat')}))
+local {N['load']}={N['rg']}({N['env']},string.char({_char_arr('load')})) or {N['rg']}({N['env']},string.char({_char_arr('loadstring')}))
+{anti}
+local function {N['dec']}(blob,alpha,key,pad)
+local base=#alpha;local idx={{}};for i=1,base do idx[{N['sub']}(alpha,i,i)]=i-1 end
+local digits={{}};for i=1,#blob do digits[#digits+1]=idx[{N['sub']}(blob,i,i)] end
+local bytes={{}};local di=1
+while di+4<=#digits do
+local n,p=0,1;for j=0,4 do n=n+(digits[di+j] or 0)*p;p=p*base end;di=di+5
+for j=0,3 do bytes[#bytes+1]=n%256;n={N['floor']}(n/256) end
+end
+if pad>0 then for i=1,pad do bytes[#bytes]=nil end end
+local state=key[1]+key[2]*256+key[3]*65536+key[4]*16777216;if state==0 then state=1 end
+local out={{}}
+for i=1,#bytes do
+state=(state*1664525+1013904223)%4294967296
+local k={N['floor']}(state/65536)%256
+local v=bytes[i]-key[((i-1)%#key)+1]-k-((i-1)*131%256)
+out[i]=(v%256+256)%256
+end
+return out
+end
+local KEY={key_tbl}
+local bytes={N['dec']}({payload},"{alph_esc}",KEY,{_num(pad)})
+local chars={{}};for i=1,#bytes do chars[i]={N['char']}(bytes[i]) end
+local src={N['concat']}(chars)
+local fn,err={N['load']}(src)
+if not fn then error(err or "load") end
+return fn(...)
+"""
+
+
+def _fallback_string_vm(src: str, intensity: str) -> str:
+    """Heavy multi-chunk path – only for original source when bytecode compile fails.
+    Outer layers use _fast_outer_vm instead (much faster)."""
+    key = bytes(random.randint(0, 255) for _ in range(16))
+    raw = src.encode("utf-8")
+    # larger chunks → fewer iterations, still fragmented
     chunks = []
     i = 0
     while i < len(raw):
-        sz = random.randint(8, 48)
+        sz = random.randint(64, 256)
         chunks.append(raw[i:i+sz])
         i += sz
-    # Encode each chunk separately with different derived keys
     encoded_parts = []
     for ci, ch in enumerate(chunks):
         ck = bytes((key[j] + ci * 17 + j) & 0xFF for j in range(len(key)))
         enc = _encode_bc(ch, ck)
         b85, alph, pad = _b85(enc)
         encoded_parts.append((b85, alph, pad, ck))
-    N = {k: _rand_ident() for k in ("dec", "floor", "char", "sub", "concat", "rg", "env", "load", "run", "parts")}
-    # Build the Lua that decodes each part then joins
+    N = {k: _rand_ident() for k in ("dec", "floor", "char", "sub", "concat", "rg", "env", "load", "parts")}
     parts_code = []
     for idx, (b85, alph, pad, ck) in enumerate(encoded_parts):
         eq = "="
@@ -1441,21 +1508,13 @@ local {N['char']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('string'
 local {N['sub']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('sub')}))
 local {N['concat']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('table')})),string.char({_char_arr('concat')}))
 local {N['load']}={N['rg']}({N['env']},string.char({_char_arr('load')})) or {N['rg']}({N['env']},string.char({_char_arr('loadstring')}))
-do
-  local _t=type;local _p=pcall;local _rg=rawget;local _rs=rawset;local _Gref=_G
-  if _t(_t)~="function" then while true do end end
-  local dbg=_rg(_Gref,"debug")
-  if _t(dbg)=="table" then
-    local empty=function() end
-    for _,k in pairs({{"getinfo","getupvalue","setupvalue","getlocal","setlocal","getregistry","traceback","sethook","gethook","getfenv","setfenv"}}) do
-      _p(function() _rs(dbg,k,empty) end)
-    end
-    _p(function() _rs(_Gref,"debug",nil) end)
-  end
-  _p(function()
-    if getfenv then getfenv=function(f) if f==0 or f==1 then return {{}} end return getfenv(f) end end
-    if setfenv then setfenv=function() end end
-  end)
+do local _t=type;local _p=pcall;local _rg=rawget;local _rs=rawset;local _Gref=_G
+if _t(_t)~="function" then while true do end end
+local dbg=_rg(_Gref,"debug")
+if _t(dbg)=="table" then local e=function()end
+for _,k in pairs({{"getinfo","getupvalue","setupvalue","getlocal","setlocal","getregistry","traceback","sethook","gethook","getfenv","setfenv"}}) do _p(function()_rs(dbg,k,e)end) end
+_p(function()_rs(_Gref,"debug",nil)end) end
+_p(function() if getfenv then getfenv=function(f)if f==0 or f==1 then return {{}} end return getfenv(f) end end if setfenv then setfenv=function()end end end)
 end
 local function {N['dec']}(blob,alpha,key,pad)
 local base=#alpha;local idx={{}};for i=1,base do idx[{N['sub']}(alpha,i,i)]=i-1 end
@@ -1492,6 +1551,7 @@ return fn(...)
 
 
 
+
 def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     code = (code or "").strip()
     if not code:
@@ -1519,14 +1579,14 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
         b85, alph, pad = _b85(enc)
         current = _emit_vm_runtime(b85, alph, pad, key, op, intensity)
     else:
-        # complex script: fallback path (still fragmented, no single source blob)
+        # complex script: heavy multi-chunk path (only once, on original source)
         current = _fallback_string_vm(src, intensity)
 
-    # Outer VM layers: always at least 1 outer envelope, more for higher intensity
-    # v1 = 1 outer, v2 = 2 outer, v3 = 3 outer  → total nested VMs
-    outer_layers = {"v1": 1, "v2": 2, "v3": 3}.get(intensity, 2)
+    # Outer VM layers – use FAST single-blob wrapper (was the main slowdown)
+    # v1 = 1 outer, v2 = 2 outer, v3 = 2 outer (capped for speed)
+    outer_layers = {"v1": 1, "v2": 2, "v3": 2}.get(intensity, 1)
     for _ in range(outer_layers):
-        current = _fallback_string_vm(current, intensity)
+        current = _fast_outer_vm(current, intensity)
 
     nl = chr(10)
     return (
@@ -2860,4 +2920,5 @@ if __name__ == "__main__":
     print(f"{APP_NAME} Obfuscator v{VERSION}")
     print(f"Listening on port {port}")
     print(f"Admin: /admin  (user={ADMIN_USERNAME} / pass={ADMIN_PASSWORD})")
-    print
+    print(f"DB: PostgreSQL (DATABASE_URL set={bool(DATABASE_URL)})")
+    uvicorn.run(app, host="0.0.0.0", port=port)
