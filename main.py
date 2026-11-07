@@ -1,4 +1,3 @@
-"""
 from fastapi import FastAPI, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
