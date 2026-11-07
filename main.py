@@ -1209,21 +1209,22 @@ end
     body = f"""
 local {N['rg']} = rawget
 local {N['env']} = {N['rg']}(_G, string.char({_char_arr('_G')})) or _G
-local {N['char']} = {N['rg']}({N['rg']}({N['env']}, string.char({_char_arr('string')})), string.char({_char_arr('char')}))
-local {N['sub']} = {N['rg']}({N['rg']}({N['env']}, string.char({_char_arr('string')})), string.char({_char_arr('sub')}))
-local {N['concat']} = {N['rg']}({N['rg']}({N['env']}, string.char({_char_arr('table')})), string.char({_char_arr('concat')}))
-local {N['floor']} = {N['rg']}({N['rg']}({N['env']}, string.char({_char_arr('math')})), string.char({_char_arr('floor')}))
-local {N['pack']} = {N['rg']}({N['rg']}({N['env']}, string.char({_char_arr('table')})), string.char({_char_arr('pack')}))
-local {N['unpack']} = {N['rg']}({N['rg']}({N['env']}, string.char({_char_arr('table')})), string.char({_char_arr('unpack')})) or unpack
-local {N['pcall']} = {N['rg']}({N['env']}, string.char({_char_arr('pcall')}))
-local {N['type']} = {N['rg']}({N['env']}, string.char({_char_arr('type')}))
-local {N['error']} = {N['rg']}({N['env']}, string.char({_char_arr('error')}))
-local {N['setmt']} = {N['rg']}({N['env']}, string.char({_char_arr('setmetatable')}))
-local {N['rawget']} = {N['rg']}({N['env']}, string.char({_char_arr('rawget')}))
-local {N['rawset']} = {N['rg']}({N['env']}, string.char({_char_arr('rawset')}))
-local {N['tostring']} = {N['rg']}({N['env']}, string.char({_char_arr('tostring')}))
-local {N['tonumber']} = {N['rg']}({N['env']}, string.char({_char_arr('tonumber')}))
-local {N['select']} = {N['rg']}({N['env']}, string.char({_char_arr('select')}))
+local function {N['rg']}sg(t, k) local v = {N['rg']}(t, k) if v ~= nil then return v end return t[k] end
+local {N['char']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('string')})), string.char({_char_arr('char')}))
+local {N['sub']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('string')})), string.char({_char_arr('sub')}))
+local {N['concat']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('table')})), string.char({_char_arr('concat')}))
+local {N['floor']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('math')})), string.char({_char_arr('floor')}))
+local {N['pack']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('table')})), string.char({_char_arr('pack')}))
+local {N['unpack']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('table')})), string.char({_char_arr('unpack')})) or unpack
+local {N['pcall']} = {N['rg']}sg({N['env']}, string.char({_char_arr('pcall')}))
+local {N['type']} = {N['rg']}sg({N['env']}, string.char({_char_arr('type')}))
+local {N['error']} = {N['rg']}sg({N['env']}, string.char({_char_arr('error')}))
+local {N['setmt']} = {N['rg']}sg({N['env']}, string.char({_char_arr('setmetatable')}))
+local {N['rawget']} = {N['rg']}sg({N['env']}, string.char({_char_arr('rawget')}))
+local {N['rawset']} = {N['rg']}sg({N['env']}, string.char({_char_arr('rawset')}))
+local {N['tostring']} = {N['rg']}sg({N['env']}, string.char({_char_arr('tostring')}))
+local {N['tonumber']} = {N['rg']}sg({N['env']}, string.char({_char_arr('tonumber')}))
+local {N['select']} = {N['rg']}sg({N['env']}, string.char({_char_arr('select')}))
 {anti}
 local function {N['decode']}(blob, alpha, key, pad)
   local base = #alpha
@@ -1307,7 +1308,7 @@ local function {N['vm']}(...)
     elseif op == OP_GETGLOBAL then
       local idx = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
       local name = {N['kn']}[idx + 1]
-      push({N['rg']}({N['env']}, name))
+      push({N['rg']}sg({N['env']}, name))
     elseif op == OP_SETGLOBAL then
       local idx = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
       local name = {N['kn']}[idx + 1]
@@ -1434,11 +1435,12 @@ end
     return f"""
 local {N['rg']}=rawget
 local {N['env']}={N['rg']}(_G,string.char({_char_arr('_G')})) or _G
-local {N['floor']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('math')})),string.char({_char_arr('floor')}))
-local {N['char']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('char')}))
-local {N['sub']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('sub')}))
-local {N['concat']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('table')})),string.char({_char_arr('concat')}))
-local {N['load']}={N['rg']}({N['env']},string.char({_char_arr('load')})) or {N['rg']}({N['env']},string.char({_char_arr('loadstring')}))
+local function {N['rg']}sg(t,k) local v={N['rg']}(t,k) if v~=nil then return v end return t[k] end
+local {N['floor']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('math')})),string.char({_char_arr('floor')}))
+local {N['char']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('char')}))
+local {N['sub']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('sub')}))
+local {N['concat']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('table')})),string.char({_char_arr('concat')}))
+local {N['load']}={N['rg']}sg({N['env']},string.char({_char_arr('load')})) or {N['rg']}sg({N['env']},string.char({_char_arr('loadstring')}))
 {anti}
 local function {N['dec']}(blob,alpha,key,pad)
 local base=#alpha;local idx={{}};for i=1,base do idx[{N['sub']}(alpha,i,i)]=i-1 end
@@ -1503,11 +1505,12 @@ def _fallback_string_vm(src: str, intensity: str) -> str:
     return f"""
 local {N['rg']}=rawget
 local {N['env']}={N['rg']}(_G,string.char({_char_arr('_G')})) or _G
-local {N['floor']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('math')})),string.char({_char_arr('floor')}))
-local {N['char']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('char')}))
-local {N['sub']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('sub')}))
-local {N['concat']}={N['rg']}({N['rg']}({N['env']},string.char({_char_arr('table')})),string.char({_char_arr('concat')}))
-local {N['load']}={N['rg']}({N['env']},string.char({_char_arr('load')})) or {N['rg']}({N['env']},string.char({_char_arr('loadstring')}))
+local function {N['rg']}sg(t,k) local v={N['rg']}(t,k) if v~=nil then return v end return t[k] end
+local {N['floor']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('math')})),string.char({_char_arr('floor')}))
+local {N['char']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('char')}))
+local {N['sub']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('sub')}))
+local {N['concat']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('table')})),string.char({_char_arr('concat')}))
+local {N['load']}={N['rg']}sg({N['env']},string.char({_char_arr('load')})) or {N['rg']}sg({N['env']},string.char({_char_arr('loadstring')}))
 do local _t=type;local _p=pcall;local _rg=rawget;local _rs=rawset;local _Gref=_G
 if _t(_t)~="function" then while true do end end
 local dbg=_rg(_Gref,"debug")
