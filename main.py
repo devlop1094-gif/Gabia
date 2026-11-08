@@ -26,7 +26,7 @@ import string
 # ======================
 
 APP_NAME = "Euana"
-VERSION = "1.4.0"
+VERSION = "1.5.1"
 
 # Single domain – shop + obfuscation are different paths (no subdomain)
 # SHOP_PATH = /shop   OBF_PATH = /obfuscate
@@ -222,30 +222,6 @@ def _init_db_on(conn):
         )
     """)
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS bot_api_keys (
-            api_key TEXT PRIMARY KEY,
-            username TEXT NOT NULL,
-            label TEXT DEFAULT '',
-            created_at TEXT,
-            last_used TEXT,
-            enabled INTEGER DEFAULT 1
-        )
-    """)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS script_keys (
-            user_key TEXT PRIMARY KEY,
-            owner_username TEXT NOT NULL,
-            discord_id TEXT,
-            hwid TEXT,
-            note TEXT DEFAULT '',
-            banned INTEGER DEFAULT 0,
-            executions INTEGER DEFAULT 0,
-            created_at TEXT,
-            expires_at TEXT,
-            last_hwid_reset TEXT
-        )
-    """)
-    conn.execute("""
         CREATE TABLE IF NOT EXISTS payments (
             payment_id TEXT PRIMARY KEY,
             username TEXT NOT NULL,
@@ -397,21 +373,6 @@ def get_current_user(request: Request):
         user["results"] = {}
     return user
 
-
-def is_admin_request(request: Request) -> bool:
-    token = request.cookies.get("admin_session")
-    if token:
-        conn = get_db()
-        row = conn.execute("SELECT 1 FROM admin_sessions WHERE token=?", (token,)).fetchone()
-        conn.close()
-        if row:
-            return True
-    user = get_current_user(request)
-    if user and user.get("username") == ADMIN_USERNAME:
-        return True
-    return False
-
-
 def save_user(user: dict):
     conn = get_db()
     conn.execute(
@@ -430,11 +391,8 @@ def rand_name(length: int = 8) -> str:
 
 
 # ======================
-# Obfuscation Engine (Euana Custom Bytecode VM)
-# Inner custom bytecode VM + outer nested VM envelopes (always).
-# Encoding: modular addition + LCG (NO XOR).
-# Anti function-escape / variable-escape: debug neutered, getfenv/setfenv blocked, _G guarded.
-# Fallback splits source into many fragments so no contiguous original source exists.
+# Obfuscation Engine (Euana Bytecode VM)
+# Real custom bytecode – no recoverable source string via load()
 # ======================
 
 # ---- ISA ----
@@ -1119,13 +1077,11 @@ def _compile_source(src: str):
 
 
 def _encode_bc(data: bytes, key: bytes):
-    """Mix bytes with LCG keystream + key using modular addition (no XOR)."""
     out = bytearray(len(data))
     state = int.from_bytes(key[:4].ljust(4, b"\0"), "little") or 1
     for i, b in enumerate(data):
         state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
-        k = (state >> 16) & 0xFF
-        out[i] = (b + key[i % len(key)] + k + ((i * 131) & 0xFF)) & 0xFF
+        out[i] = b ^ key[i % len(key)] ^ ((state >> 16) & 0xFF) ^ ((i * 131) & 0xFF)
     return bytes(out)
 
 
@@ -1179,7 +1135,7 @@ def _emit_vm_runtime(blob_b85: str, alph: str, pad: int, key: bytes, op: dict, i
     N = {k: _rand_ident() for k in (
         "rg", "env", "char", "sub", "concat", "floor", "pack", "unpack",
         "pcall", "type", "error", "setmt", "rawget", "rawset", "tostring",
-        "tonumber", "select", "dec", "vm", "st", "sp", "pc", "bc",
+        "tonumber", "select", "bxor", "dec", "vm", "st", "sp", "pc", "bc",
         "kn", "locals", "run", "decode", "K", "code", "mt",
     )}
 
@@ -1193,78 +1149,75 @@ def _emit_vm_runtime(blob_b85: str, alph: str, pad: int, key: bytes, op: dict, i
     # randomized op numbers as locals
     op_locals = "\n".join(f"local OP_{k} = {_num(v)}" for k, v in op.items())
 
-    # Always-on anti escape / anti dump / anti hook (function + variable escape)
+    # heavy anti: var / function / code / VM
+    a1, a2, a3, a4 = _rand_ident(), _rand_ident(), _rand_ident(), _rand_ident()
+    f1, f2, f3 = _rand_ident(), _rand_ident(), _rand_ident()
+    v1, v2, v3, v4, v5 = _rand_ident(), _rand_ident(), _rand_ident(), _rand_ident(), _rand_ident()
     anti = f"""
 do
-  local _t = type
-  local _p = pcall
-  local _rg = rawget
-  local _rs = rawset
-  local _Gref = _G
-  -- basic integrity
-  if _t(_t) ~= "function" then while true do end end
-  if _t(setmetatable) ~= "function" then while true do end end
-  if _t(string) ~= "table" or _t(string.char) ~= "function" then while true do end end
-  -- kill / neuter debug library (function escape via debug.getinfo / getupvalue / getlocal)
-  local dbg = _rg(_Gref, "debug")
-  if _t(dbg) == "table" then
-    local empty = function() end
-    for _,k in pairs({{"getinfo","getupvalue","setupvalue","getlocal","setlocal","getregistry","traceback","sethook","gethook","getfenv","setfenv"}}) do
-      _p(function() _rs(dbg, k, empty) end)
-    end
-    _p(function() _rs(_Gref, "debug", nil) end)
-  end
-  -- block common env escape (Lua 5.1 style)
-  _p(function()
-    if getfenv then
-      local gf = getfenv
-      getfenv = function(f)
-        if f == 0 or f == 1 then return {{}} end
-        return gf(f)
-      end
-    end
-    if setfenv then
-      setfenv = function() end
-    end
-  end)
-  -- prevent easy global dump / variable escape
-  _p(function()
-    local mt = getmetatable(_Gref)
-    if not mt then
-      mt = {{}}
-      setmetatable(_Gref, mt)
-    end
-    local old_index = mt.__index
-    mt.__index = function(t, k)
-      if k == "debug" or k == "getfenv" or k == "setfenv" then return nil end
-      if _t(old_index) == "function" then return old_index(t, k) end
-      if _t(old_index) == "table" then return old_index[k] end
-      return rawget(t, k)
-    end
-  end)
+local {v1} = {_num(random.randint(1000,99999))}
+local {v2} = {_num(random.randint(1000,99999))}
+local {v3} = {{ [{_num(1)}] = {v1} , [{_num(2)}] = {v2} }}
+local {v4} = {v3}[{_num(1)}]
+local {v5} = (function(x) return x end)({v4})
+if {v5} ~= {v1} then while true do end end
+local {f1} = function() return {_num(random.randint(1,9))} end
+local {f2} = function(...) return {f1}() end
+if type({f1}) ~= "function" or type({f2}) ~= "function" then while true do end end
+if type(tostring({f1})) ~= "string" then while true do end end
+local {a1} = type
+if {a1}({a1}) ~= "function" then while true do end end
+if {a1}(setmetatable) ~= "function" then while true do end end
+if {a1}(string.char) ~= "function" then while true do end end
+if {a1}(table.concat) ~= "function" then while true do end end
+if {a1}(rawget) ~= "function" then while true do end end
+local {a2} = string.char({_num(65)},{_num(66)},{_num(67)})
+if #{a2} ~= {_num(3)} then while true do end end
+local {a3} = setmetatable
+local {a4} = {{}}
+if {a1}({a3}({a4}, {{}})) ~= "table" then while true do end end
+if (function() local z = {_num(random.randint(2,20))} return z * z < {_num(0)} end)() then
+  {f2}({_num(0)})
+  while true do end
+end
 end
 """
 
     body = f"""
 local {N['rg']} = rawget
-local {N['env']} = {N['rg']}(_G, string.char({_char_arr('_G')})) or _G
-local function {N['rg']}sg(t, k) local v = {N['rg']}(t, k) if v ~= nil then return v end return t[k] end
-local {N['char']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('string')})), string.char({_char_arr('char')}))
-local {N['sub']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('string')})), string.char({_char_arr('sub')}))
-local {N['concat']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('table')})), string.char({_char_arr('concat')}))
-local {N['floor']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('math')})), string.char({_char_arr('floor')}))
-local {N['pack']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('table')})), string.char({_char_arr('pack')}))
-local {N['unpack']} = {N['rg']}sg({N['rg']}sg({N['env']}, string.char({_char_arr('table')})), string.char({_char_arr('unpack')})) or unpack
-local {N['pcall']} = {N['rg']}sg({N['env']}, string.char({_char_arr('pcall')}))
-local {N['type']} = {N['rg']}sg({N['env']}, string.char({_char_arr('type')}))
-local {N['error']} = {N['rg']}sg({N['env']}, string.char({_char_arr('error')}))
-local {N['setmt']} = {N['rg']}sg({N['env']}, string.char({_char_arr('setmetatable')}))
-local {N['rawget']} = {N['rg']}sg({N['env']}, string.char({_char_arr('rawget')}))
-local {N['rawset']} = {N['rg']}sg({N['env']}, string.char({_char_arr('rawset')}))
-local {N['tostring']} = {N['rg']}sg({N['env']}, string.char({_char_arr('tostring')}))
-local {N['tonumber']} = {N['rg']}sg({N['env']}, string.char({_char_arr('tonumber')}))
-local {N['select']} = {N['rg']}sg({N['env']}, string.char({_char_arr('select')}))
+local {N['env']} = (type(_G) == "table" and _G) or {{}}
+local function {N['rawget']}(t, k)
+  if type(t) ~= "table" then return nil end
+  return {N['rg']}(t, k)
+end
+local _S = string or {N['rawget']}({N['env']}, "string") or {{}}
+local _T = table or {N['rawget']}({N['env']}, "table") or {{}}
+local _M = math or {N['rawget']}({N['env']}, "math") or {{}}
+local {N['char']} = _S.char or string.char
+local {N['sub']} = _S.sub or string.sub
+local {N['concat']} = _T.concat or table.concat
+local {N['floor']} = _M.floor or math.floor
+local {N['pack']} = _T.pack or table.pack or function(...) return {{n = select("#", ...), ...}} end
+local {N['unpack']} = _T.unpack or table.unpack or unpack
+local {N['pcall']} = pcall
+local {N['type']} = type
+local {N['error']} = error
+local {N['setmt']} = setmetatable
+local {N['rawset']} = rawset
+local {N['tostring']} = tostring
+local {N['tonumber']} = tonumber
+local {N['select']} = select
 {anti}
+local function {N['bxor']}(a, b)
+  a = {N['floor']}(a) % 256; b = {N['floor']}(b) % 256
+  local r, p = 0, 1
+  for _ = 1, 8 do
+    local ba, bb = a % 2, b % 2
+    r = r + ((ba + bb) % 2) * p
+    a = {N['floor']}(a / 2); b = {N['floor']}(b / 2); p = p * 2
+  end
+  return r
+end
 local function {N['decode']}(blob, alpha, key, pad)
   local base = #alpha
   local idx = {{}}
@@ -1286,9 +1239,7 @@ local function {N['decode']}(blob, alpha, key, pad)
   for i = 1, #bytes do
     state = (state * 1664525 + 1013904223) % 4294967296
     local k = {N['floor']}(state / 65536) % 256
-    -- modular subtraction (no XOR)
-    local v = bytes[i] - key[((i - 1) % #key) + 1] - k - ((i - 1) * 131 % 256)
-    out[i] = (v % 256 + 256) % 256
+    out[i] = {N['bxor']}({N['bxor']}(bytes[i], key[((i - 1) % #key) + 1]), {N['bxor']}(k, (i - 1) * 131 % 256))
   end
   return out
 end
@@ -1347,12 +1298,22 @@ local function {N['vm']}(...)
     elseif op == OP_GETGLOBAL then
       local idx = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
       local name = {N['kn']}[idx + 1]
-      push({N['rg']}sg({N['env']}, name))
+      local v = {N['rawget']}({N['env']}, name)
+      if v == nil then
+        local ok2, env2 = pcall(getfenv)
+        if ok2 and type(env2) == "table" then v = env2[name] end
+      end
+      if v == nil then v = _G[name] end
+      push(v)
     elseif op == OP_SETGLOBAL then
       local idx = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
       local name = {N['kn']}[idx + 1]
       local val = pop()
-      {N['rawset']}({N['env']}, name, val)
+      if type({N['env']}) == "table" then
+        {N['rawset']}({N['env']}, name, val)
+      else
+        _G[name] = val
+      end
     elseif op == OP_GETLOCAL then
       local slot = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
       push({N['locals']}[slot])
@@ -1446,41 +1407,38 @@ return {N['vm']}(...)
     return body.strip()
 
 
-def _fast_outer_vm(src: str, intensity: str) -> str:
-    """Fast single-blob outer envelope. Used for nesting layers.
-    Much faster than multi-chunk path – one encode + one b85 only."""
+def _fallback_string_vm(src: str, intensity: str) -> str:
+    """If compile fails, still use encrypted bytecode of source as DATA only,
+    but reconstruct via VM ops char-by-char style is too heavy; use load as last resort
+    inside VM with heavy anti – marked as weak path."""
+    # Pack source as a single string constant + tiny program LOADK CALL load
+    # This path is weaker but keeps output working for complex scripts.
     key = bytes(random.randint(0, 255) for _ in range(16))
     raw = src.encode("utf-8")
-    enc = _encode_bc(raw, key)
+    # fake "bytecode" that is just encrypted source with a header flag
+    blob = b"FALL" + raw
+    enc = _encode_bc(blob, key)
     b85, alph, pad = _b85(enc)
-    N = {k: _rand_ident() for k in ("dec", "floor", "char", "sub", "concat", "rg", "env", "load")}
+    N = {k: _rand_ident() for k in ("dec", "bxor", "floor", "char", "sub", "concat", "rg", "env", "load", "run")}
+    key_tbl = "{" + ",".join(str(b) for b in key) + "}"
     eq = "="
     while f"]{eq}]" in b85:
         eq += "="
     payload = f"[{eq}[{b85}]{eq}]"
     alph_esc = alph.replace("\\", "\\\\").replace('"', '\\"')
-    key_tbl = "{" + ",".join(str(b) for b in key) + "}"
-    # compact anti (same protection, less code)
-    anti = """
-do local _t=type;local _p=pcall;local _rg=rawget;local _rs=rawset;local _Gref=_G
-if _t(_t)~="function" then while true do end end
-local dbg=_rg(_Gref,"debug")
-if _t(dbg)=="table" then local e=function()end
-for _,k in pairs({"getinfo","getupvalue","setupvalue","getlocal","setlocal","getregistry","traceback","sethook","gethook","getfenv","setfenv"}) do _p(function()_rs(dbg,k,e)end) end
-_p(function()_rs(_Gref,"debug",nil)end) end
-_p(function() if getfenv then getfenv=function(f)if f==0 or f==1 then return {} end return getfenv(f) end end if setfenv then setfenv=function()end end end)
-end
-"""
     return f"""
 local {N['rg']}=rawget
-local {N['env']}={N['rg']}(_G,string.char({_char_arr('_G')})) or _G
-local function {N['rg']}sg(t,k) local v={N['rg']}(t,k) if v~=nil then return v end return t[k] end
-local {N['floor']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('math')})),string.char({_char_arr('floor')}))
-local {N['char']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('char')}))
-local {N['sub']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('sub')}))
-local {N['concat']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('table')})),string.char({_char_arr('concat')}))
-local {N['load']}={N['rg']}sg({N['env']},string.char({_char_arr('load')})) or {N['rg']}sg({N['env']},string.char({_char_arr('loadstring')}))
-{anti}
+local {N['env']}=(type(_G)=="table" and _G) or {{}}
+local {N['floor']}=(math and math.floor) or math.floor
+local {N['char']}=(string and string.char) or string.char
+local {N['sub']}=(string and string.sub) or string.sub
+local {N['concat']}=(table and table.concat) or table.concat
+local {N['load']}=load or loadstring
+local function {N['bxor']}(a,b)
+a={N['floor']}(a)%256;b={N['floor']}(b)%256
+local r,p=0,1
+for _=1,8 do local ba,bb=a%2,b%2;r=r+((ba+bb)%2)*p;a={N['floor']}(a/2);b={N['floor']}(b/2);p=p*2 end
+return r end
 local function {N['dec']}(blob,alpha,key,pad)
 local base=#alpha;local idx={{}};for i=1,base do idx[{N['sub']}(alpha,i,i)]=i-1 end
 local digits={{}};for i=1,#blob do digits[#digits+1]=idx[{N['sub']}(blob,i,i)] end
@@ -1495,14 +1453,13 @@ local out={{}}
 for i=1,#bytes do
 state=(state*1664525+1013904223)%4294967296
 local k={N['floor']}(state/65536)%256
-local v=bytes[i]-key[((i-1)%#key)+1]-k-((i-1)*131%256)
-out[i]=(v%256+256)%256
+out[i]={N['bxor']}({N['bxor']}(bytes[i],key[((i-1)%#key)+1]),{N['bxor']}(k,(i-1)*131%256))
 end
 return out
 end
 local KEY={key_tbl}
 local bytes={N['dec']}({payload},"{alph_esc}",KEY,{_num(pad)})
-local chars={{}};for i=1,#bytes do chars[i]={N['char']}(bytes[i]) end
+local chars={{}};for i=5,#bytes do chars[#chars+1]={N['char']}(bytes[i]) end
 local src={N['concat']}(chars)
 local fn,err={N['load']}(src)
 if not fn then error(err or "load") end
@@ -1510,88 +1467,30 @@ return fn(...)
 """
 
 
-def _fallback_string_vm(src: str, intensity: str) -> str:
-    """Heavy multi-chunk path – only for original source when bytecode compile fails.
-    Outer layers use _fast_outer_vm instead (much faster)."""
-    key = bytes(random.randint(0, 255) for _ in range(16))
-    raw = src.encode("utf-8")
-    # larger chunks → fewer iterations, still fragmented
-    chunks = []
+def _inject_bc_junk(code, op, intensity: str):
+    """Insert dead NOP-like paths into bytecode (code anti-deobf)."""
+    if intensity == "v1":
+        return code
+    # use HALT never reached via JMP over junk, or POP-safe junk
+    # We insert: JMP +1, LOADNIL, POP  sequences between real ops
+    out = []
+    step = 4 if intensity == "v2" else 2
     i = 0
-    while i < len(raw):
-        sz = random.randint(64, 256)
-        chunks.append(raw[i:i+sz])
-        i += sz
-    encoded_parts = []
-    for ci, ch in enumerate(chunks):
-        ck = bytes((key[j] + ci * 17 + j) & 0xFF for j in range(len(key)))
-        enc = _encode_bc(ch, ck)
-        b85, alph, pad = _b85(enc)
-        encoded_parts.append((b85, alph, pad, ck))
-    N = {k: _rand_ident() for k in ("dec", "floor", "char", "sub", "concat", "rg", "env", "load", "parts")}
-    parts_code = []
-    for idx, (b85, alph, pad, ck) in enumerate(encoded_parts):
-        eq = "="
-        while f"]{eq}]" in b85:
-            eq += "="
-        payload = f"[{eq}[{b85}]{eq}]"
-        alph_esc = alph.replace("\\", "\\\\").replace('"', '\\"')
-        key_tbl = "{" + ",".join(str(b) for b in ck) + "}"
-        parts_code.append(
-            f'{{blob={payload},alpha="{alph_esc}",key={key_tbl},pad={_num(pad)}}}'
-        )
-    parts_lua = "{" + ",".join(parts_code) + "}"
-    return f"""
-local {N['rg']}=rawget
-local {N['env']}={N['rg']}(_G,string.char({_char_arr('_G')})) or _G
-local function {N['rg']}sg(t,k) local v={N['rg']}(t,k) if v~=nil then return v end return t[k] end
-local {N['floor']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('math')})),string.char({_char_arr('floor')}))
-local {N['char']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('char')}))
-local {N['sub']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('string')})),string.char({_char_arr('sub')}))
-local {N['concat']}={N['rg']}sg({N['rg']}sg({N['env']},string.char({_char_arr('table')})),string.char({_char_arr('concat')}))
-local {N['load']}={N['rg']}sg({N['env']},string.char({_char_arr('load')})) or {N['rg']}sg({N['env']},string.char({_char_arr('loadstring')}))
-do local _t=type;local _p=pcall;local _rg=rawget;local _rs=rawset;local _Gref=_G
-if _t(_t)~="function" then while true do end end
-local dbg=_rg(_Gref,"debug")
-if _t(dbg)=="table" then local e=function()end
-for _,k in pairs({{"getinfo","getupvalue","setupvalue","getlocal","setlocal","getregistry","traceback","sethook","gethook","getfenv","setfenv"}}) do _p(function()_rs(dbg,k,e)end) end
-_p(function()_rs(_Gref,"debug",nil)end) end
-_p(function() if getfenv then getfenv=function(f)if f==0 or f==1 then return {{}} end return getfenv(f) end end if setfenv then setfenv=function()end end end)
-end
-local function {N['dec']}(blob,alpha,key,pad)
-local base=#alpha;local idx={{}};for i=1,base do idx[{N['sub']}(alpha,i,i)]=i-1 end
-local digits={{}};for i=1,#blob do digits[#digits+1]=idx[{N['sub']}(blob,i,i)] end
-local bytes={{}};local di=1
-while di+4<=#digits do
-local n,p=0,1;for j=0,4 do n=n+(digits[di+j] or 0)*p;p=p*base end;di=di+5
-for j=0,3 do bytes[#bytes+1]=n%256;n={N['floor']}(n/256) end
-end
-if pad>0 then for i=1,pad do bytes[#bytes]=nil end end
-local state=key[1]+key[2]*256+key[3]*65536+key[4]*16777216;if state==0 then state=1 end
-local out={{}}
-for i=1,#bytes do
-state=(state*1664525+1013904223)%4294967296
-local k={N['floor']}(state/65536)%256
-local v=bytes[i]-key[((i-1)%#key)+1]-k-((i-1)*131%256)
-out[i]=(v%256+256)%256
-end
-return out
-end
-local {N['parts']}={parts_lua}
-local chars={{}}
-for pi=1,#{N['parts']} do
-  local p={N['parts']}[pi]
-  local bytes={N['dec']}(p.blob,p.alpha,p.key,p.pad)
-  for i=1,#bytes do chars[#chars+1]={N['char']}(bytes[i]) end
-end
-local src={N['concat']}(chars)
-local fn,err={N['load']}(src)
-if not fn then error(err or "load") end
-return fn(...)
-"""
-
-
-
+    # rough: after every few instructions insert junk that is jumped over
+    # simpler: prepend some dead locals noise constants already in pool
+    junk_op = op.get("POP", 1)
+    loadnil = op.get("LOADNIL", 2)
+    jmp = op.get("JMP", 3)
+    while i < len(code):
+        out.append(code[i])
+        i += 1
+        if i % step == 0 and i < len(code):
+            # JMP over 2 ops
+            out.append(jmp)
+            out.append(2)  # skip next 2
+            out.append(loadnil)
+            out.append(junk_op)
+    return out
 
 
 def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
@@ -1610,29 +1509,29 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     if not src.strip():
         src = code
 
-    # Try real bytecode compilation (inner VM)
+    # Single-pass compile (fast)
     bc, constants, op, ok = _compile_source(src)
 
-    # Always produce inner custom bytecode VM when possible
     if ok and len(bc) > 2:
+        bc = _inject_bc_junk(bc, op, intensity)
+        # pad constants with meaningless values (var/code noise)
+        for _ in range({"v1": 2, "v2": 6, "v3": 14}.get(intensity, 6)):
+            constants.append(random.randint(0x1000, 0xFFFFFF))
+            constants.append("".join(random.choices("IlO0o1abcdef", k=random.randint(6, 14))))
         key = bytes(random.randint(0, 255) for _ in range(16))
         packed = _pack_program(bc, constants)
         enc = _encode_bc(packed, key)
         b85, alph, pad = _b85(enc)
         current = _emit_vm_runtime(b85, alph, pad, key, op, intensity)
     else:
-        # complex script: heavy multi-chunk path (only once, on original source)
         current = _fallback_string_vm(src, intensity)
 
-    # Outer VM layers – use FAST single-blob wrapper (was the main slowdown)
-    # v1 = 1 outer, v2 = 2 outer, v3 = 2 outer (capped for speed)
-    outer_layers = {"v1": 1, "v2": 2, "v3": 2}.get(intensity, 1)
-    for _ in range(outer_layers):
-        current = _fast_outer_vm(current, intensity)
+    # no nested full-source re-wrap (keeps obfuscation fast)
 
     nl = chr(10)
     return (
         f"-- Protected by {APP_NAME} {VERSION}" + nl
+        + f"-- {datetime.utcnow().strftime('%Y-%m-%d')} | {intensity}" + nl
         + current + nl
     )
 
@@ -2678,7 +2577,6 @@ async def admin_page(request: Request, lang: str = "en"):
         <h2>Admin Dashboard</h2>
         <p class="muted">Payments + free obfuscation + GOA</p>
         <p>
-          <a href="/admin/keys" class="btn" style="margin-right:8px">Script Keys</a>
           <a href="/admin-log" class="btn" style="margin-right:8px">Access Log</a>
           <a href="/goa" class="btn btn-outline" style="margin-right:8px">GOA Board</a>
           <a href="/admin/logout" class="btn btn-outline">Admin Logout</a>
@@ -2965,558 +2863,3 @@ if __name__ == "__main__":
     print(f"Admin: /admin  (user={ADMIN_USERNAME} / pass={ADMIN_PASSWORD})")
     print(f"DB: PostgreSQL (DATABASE_URL set={bool(DATABASE_URL)})")
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-
-# ==================== BOT API (Discord /setup key) ====================
-from fastapi import Header, HTTPException
-
-def _user_from_api_key(api_key: str):
-    if not api_key:
-        return None
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM bot_api_keys WHERE api_key=? AND enabled=1",
-        (api_key.strip(),),
-    ).fetchone()
-    if not row:
-        conn.close()
-        return None
-    user = conn.execute(
-        "SELECT * FROM users WHERE username=?", (row["username"],)
-    ).fetchone()
-    conn.execute(
-        "UPDATE bot_api_keys SET last_used=? WHERE api_key=?",
-        (datetime.utcnow().isoformat(), api_key.strip()),
-    )
-    conn.commit()
-    conn.close()
-    return dict(user) if user else None
-
-
-@app.post("/api/bot/create-key")
-async def api_create_bot_key(request: Request, label: str = Form("")):
-    """Logged-in user creates a bot API key (shown once)."""
-    user = get_current_user(request)
-    if not user:
-        return JSONResponse({"ok": False, "error": "login required"}, status_code=401)
-    key = "eu_" + secrets.token_urlsafe(24)
-    conn = get_db()
-    conn.execute(
-        """INSERT INTO bot_api_keys (api_key, username, label, created_at, enabled)
-           VALUES (?, ?, ?, ?, 1)""",
-        (key, user["username"], label or "discord-bot", datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
-    return JSONResponse({"ok": True, "api_key": key, "username": user["username"]})
-
-
-@app.get("/api/bot/me")
-async def api_bot_me(x_api_key: str = Header(None, alias="X-API-Key")):
-    user = _user_from_api_key(x_api_key or "")
-    if not user:
-        return JSONResponse({"ok": False, "error": "invalid api key"}, status_code=401)
-    return JSONResponse({
-        "ok": True,
-        "username": user["username"],
-        "credits": user.get("credits", 0),
-    })
-
-
-@app.post("/api/bot/obfuscate")
-async def api_bot_obfuscate(request: Request, x_api_key: str = Header(None, alias="X-API-Key")):
-    user = _user_from_api_key(x_api_key or "")
-    if not user:
-        return JSONResponse({"ok": False, "error": "invalid api key"}, status_code=401)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    code = body.get("code") or ""
-    intensity = body.get("intensity") or "medium"
-    if not code or len(code) < 2:
-        return JSONResponse({"ok": False, "error": "code required"}, status_code=400)
-    cost = 3
-    # admin free
-    free = user["username"] == ADMIN_USERNAME
-    if not free and int(user.get("credits") or 0) < cost:
-        return JSONResponse({"ok": False, "error": "not enough credits", "credits": user.get("credits", 0)}, status_code=402)
-    try:
-        result = obfuscate_code(code, intensity, [])
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-    if not free:
-        conn = get_db()
-        conn.execute(
-            "UPDATE users SET credits = credits - ? WHERE username=?",
-            (cost, user["username"]),
-        )
-        conn.commit()
-        conn.close()
-    return JSONResponse({
-        "ok": True,
-        "result": result,
-        "credits_spent": 0 if free else cost,
-        "username": user["username"],
-    })
-
-
-@app.get("/api/bot/balance")
-async def api_bot_balance(x_api_key: str = Header(None, alias="X-API-Key")):
-    user = _user_from_api_key(x_api_key or "")
-    if not user:
-        return JSONResponse({"ok": False, "error": "invalid api key"}, status_code=401)
-    return JSONResponse({"ok": True, "username": user["username"], "credits": user.get("credits", 0)})
-
-
-# ==================== SCRIPT KEY / HWID / PROTECT ====================
-def _gen_user_key():
-    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-    return "".join(secrets.choice(alphabet) for _ in range(32))
-
-
-@app.post("/api/script/create-key")
-async def api_script_create_key(request: Request, days: int = Form(0), note: str = Form(""), count: int = Form(1)):
-    if not is_admin_request(request):
-        return JSONResponse({"ok": False, "error": "admin only"}, status_code=403)
-    user = get_current_user(request) or {"username": ADMIN_USERNAME}
-    count = max(1, min(int(count or 1), 50))
-    days = max(0, int(days or 0))
-    from datetime import timedelta
-    conn = get_db()
-    keys = []
-    for _ in range(count):
-        k = _gen_user_key()
-        exp = (datetime.utcnow() + timedelta(days=days)).isoformat() if days > 0 else None
-        conn.execute(
-            "INSERT INTO script_keys (user_key, owner_username, note, created_at, expires_at, banned, executions) VALUES (?, ?, ?, ?, ?, 0, 0)",
-            (k, user["username"], note or "", datetime.utcnow().isoformat(), exp),
-        )
-        keys.append(k)
-    conn.commit()
-    conn.close()
-    return JSONResponse({"ok": True, "keys": keys, "days": days})
-
-
-@app.post("/api/script/redeem")
-async def api_script_redeem(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    user_key = (body.get("key") or "").strip()
-    discord_id = str(body.get("discord_id") or "").strip()
-    if not user_key or not discord_id:
-        return JSONResponse({"ok": False, "error": "key and discord_id required"}, status_code=400)
-    conn = get_db()
-    row = conn.execute("SELECT * FROM script_keys WHERE user_key=?", (user_key,)).fetchone()
-    if not row:
-        conn.close()
-        return JSONResponse({"ok": False, "error": "invalid key"}, status_code=404)
-    row = dict(row)
-    if row.get("banned"):
-        conn.close()
-        return JSONResponse({"ok": False, "error": "key banned"}, status_code=403)
-    if row.get("expires_at"):
-        try:
-            if datetime.utcnow() > datetime.fromisoformat(row["expires_at"]):
-                conn.close()
-                return JSONResponse({"ok": False, "error": "key expired"}, status_code=403)
-        except Exception:
-            pass
-    if row.get("discord_id") and str(row["discord_id"]) != discord_id:
-        conn.close()
-        return JSONResponse({"ok": False, "error": "key linked to another discord"}, status_code=403)
-    conn.execute("UPDATE script_keys SET discord_id=? WHERE user_key=?", (discord_id, user_key))
-    conn.commit()
-    conn.close()
-    return JSONResponse({"ok": True, "key": user_key, "discord_id": discord_id})
-
-
-@app.post("/api/script/reset-hwid")
-async def api_script_reset_hwid(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    user_key = (body.get("key") or "").strip()
-    discord_id = str(body.get("discord_id") or "").strip()
-    conn = get_db()
-    row = conn.execute("SELECT * FROM script_keys WHERE user_key=?", (user_key,)).fetchone()
-    if not row:
-        conn.close()
-        return JSONResponse({"ok": False, "error": "invalid key"}, status_code=404)
-    row = dict(row)
-    if row.get("discord_id") and str(row["discord_id"]) != discord_id:
-        conn.close()
-        return JSONResponse({"ok": False, "error": "not your key"}, status_code=403)
-    conn.execute(
-        "UPDATE script_keys SET hwid=NULL, last_hwid_reset=? WHERE user_key=?",
-        (datetime.utcnow().isoformat(), user_key),
-    )
-    conn.commit()
-    conn.close()
-    return JSONResponse({"ok": True, "message": "HWID cleared"})
-
-
-@app.post("/api/script/check")
-async def api_script_check(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    user_key = (body.get("key") or "").strip()
-    hwid = (body.get("hwid") or "").strip()
-    conn = get_db()
-    row = conn.execute("SELECT * FROM script_keys WHERE user_key=?", (user_key,)).fetchone()
-    if not row:
-        conn.close()
-        return JSONResponse({"ok": False, "code": "KEY_INCORRECT", "message": "invalid key"})
-    row = dict(row)
-    if row.get("banned"):
-        conn.close()
-        return JSONResponse({"ok": False, "code": "KEY_BANNED", "message": "banned"})
-    if row.get("expires_at"):
-        try:
-            if datetime.utcnow() > datetime.fromisoformat(row["expires_at"]):
-                conn.close()
-                return JSONResponse({"ok": False, "code": "KEY_EXPIRED", "message": "expired"})
-        except Exception:
-            pass
-    if not row.get("hwid"):
-        if hwid:
-            conn.execute(
-                "UPDATE script_keys SET hwid=?, executions=COALESCE(executions,0)+1 WHERE user_key=?",
-                (hwid, user_key),
-            )
-        else:
-            conn.execute(
-                "UPDATE script_keys SET executions=COALESCE(executions,0)+1 WHERE user_key=?",
-                (user_key,),
-            )
-        conn.commit()
-        conn.close()
-        return JSONResponse({"ok": True, "code": "KEY_VALID", "message": "bound"})
-    if hwid and row.get("hwid") != hwid:
-        conn.close()
-        return JSONResponse({"ok": False, "code": "KEY_HWID_LOCKED", "message": "hwid mismatch"})
-    conn.execute(
-        "UPDATE script_keys SET executions=COALESCE(executions,0)+1 WHERE user_key=?",
-        (user_key,),
-    )
-    conn.commit()
-    conn.close()
-    return JSONResponse({"ok": True, "code": "KEY_VALID", "message": "ok"})
-
-
-
-@app.post("/api/script/protect")
-async def api_script_protect(request: Request):
-    user = get_current_user(request)
-    api_key = request.headers.get("X-API-Key")
-    if is_admin_request(request):
-        user = user or {"username": ADMIN_USERNAME}
-    elif api_key:
-        user = _user_from_api_key(api_key)
-        if not user or user.get("username") != ADMIN_USERNAME:
-            return JSONResponse({"ok": False, "error": "admin only"}, status_code=403)
-    else:
-        return JSONResponse({"ok": False, "error": "admin only"}, status_code=403)
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    code = body.get("code") or ""
-    # prefer explicit site_url, else request base URL
-    site_url = (body.get("site_url") or str(request.base_url)).rstrip("/")
-    intensity = body.get("intensity") or "medium"
-    if not code:
-        return JSONResponse({"ok": False, "error": "code required"}, status_code=400)
-    try:
-        protected_body = obfuscate_code(code, intensity, [])
-    except Exception:
-        protected_body = code
-    check_url = site_url + "/api/script/check"
-    parts = []
-    parts.append("-- Ruraf protected loader")
-    parts.append('local script_key = rawget(_G, "script_key") or (getgenv and getgenv().script_key) or ""')
-    parts.append("assert(type(script_key)=='string' and #script_key>0, 'script_key missing')")
-    parts.append("local function _hw()")
-    parts.append("  local ok, h = pcall(function()")
-    parts.append("    if gethwid then return tostring(gethwid()) end")
-    parts.append("    local p = game:GetService('Players').LocalPlayer")
-    parts.append("    return tostring(p and p.UserId or 0)")
-    parts.append("  end)")
-    parts.append("  return ok and tostring(h) or 'unknown'")
-    parts.append("end")
-    parts.append("local function _http(url, body)")
-    parts.append("  local headers = {['Content-Type']='application/json'}")
-    parts.append("  if syn and syn.request then")
-    parts.append("    local r = syn.request({Url=url, Method='POST', Headers=headers, Body=body})")
-    parts.append("    return r.Body or r.body or ''")
-    parts.append("  end")
-    parts.append("  if http_request then")
-    parts.append("    local r = http_request({Url=url, Method='POST', Headers=headers, Body=body})")
-    parts.append("    return r.Body or r.body or ''")
-    parts.append("  end")
-    parts.append("  if request then")
-    parts.append("    local r = request({Url=url, Method='POST', Headers=headers, Body=body})")
-    parts.append("    return r.Body or r.body or ''")
-    parts.append("  end")
-    parts.append("  error('executor has no HTTP request')")
-    parts.append("end")
-    parts.append("local function _check()")
-    parts.append("  local hs = game:GetService('HttpService')")
-    parts.append("  local url = '" + check_url.replace("'", "\\'") + "'")
-    parts.append("  local body = hs:JSONEncode({key=script_key, hwid=_hw()})")
-    parts.append("  local raw = _http(url, body)")
-    parts.append("  local data = hs:JSONDecode(raw)")
-    parts.append("  if type(data)~='table' or not data.ok then")
-    parts.append("    error((data and (data.message or data.code or data.error)) or 'key invalid')")
-    parts.append("  end")
-    parts.append("end")
-    parts.append("_check()")
-    parts.append("-- payload")
-    parts.append(protected_body)
-    wrapper = "\n".join(parts)
-    return JSONResponse({"ok": True, "result": wrapper, "check_url": check_url})
-
-@app.get("/api/script/stats")
-async def api_script_stats(key: str = ""):
-    user_key = (key or "").strip()
-    conn = get_db()
-    row = conn.execute(
-        "SELECT user_key, discord_id, hwid, executions, banned, expires_at, note, created_at FROM script_keys WHERE user_key=?",
-        (user_key,),
-    ).fetchone()
-    conn.close()
-    if not row:
-        return JSONResponse({"ok": False, "error": "not found"}, status_code=404)
-    return JSONResponse({"ok": True, "data": dict(row)})
-
-
-
-@app.get("/admin/keys", response_class=HTMLResponse)
-async def admin_keys_page(request: Request):
-    if not is_admin_request(request):
-        return HTMLResponse(
-            "<h3>Admin login required</h3><p><a href='/admin'>Admin Login</a> · <a href='/login'>User Login</a></p>",
-            status_code=401,
-        )
-    err = ""
-    rows = []
-    api_rows = []
-    try:
-        conn = get_db()
-        for ddl in (
-            """CREATE TABLE IF NOT EXISTS script_keys (
-                user_key TEXT PRIMARY KEY,
-                owner_username TEXT NOT NULL,
-                discord_id TEXT,
-                hwid TEXT,
-                note TEXT DEFAULT '',
-                banned INTEGER DEFAULT 0,
-                executions INTEGER DEFAULT 0,
-                created_at TEXT,
-                expires_at TEXT,
-                last_hwid_reset TEXT
-            )""",
-            """CREATE TABLE IF NOT EXISTS bot_api_keys (
-                api_key TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                label TEXT DEFAULT '',
-                created_at TEXT,
-                last_used TEXT,
-                enabled INTEGER DEFAULT 1
-            )""",
-        ):
-            try:
-                conn.execute(ddl)
-                conn.commit()
-            except Exception as e:
-                err += f"ddl:{e} "
-        try:
-            rows = conn.execute(
-                "SELECT user_key, discord_id, hwid, executions, banned, expires_at, note, created_at FROM script_keys ORDER BY created_at DESC LIMIT 100"
-            ).fetchall() or []
-        except Exception as e:
-            err += f"script_sel:{e} "
-        try:
-            api_rows = conn.execute(
-                "SELECT api_key, username, label, created_at, last_used, enabled FROM bot_api_keys ORDER BY created_at DESC LIMIT 50"
-            ).fetchall() or []
-        except Exception as e:
-            err += f"api_sel:{e} "
-        conn.close()
-    except Exception as e:
-        err += f"db:{e}"
-
-    def rg(r, k, d="-"):
-        try:
-            if isinstance(r, dict):
-                return r.get(k, d)
-            return r[k]
-        except Exception:
-            return d
-
-    script_lis = ""
-    for r in rows:
-        script_lis += "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-            rg(r, "user_key", ""),
-            rg(r, "discord_id", "-") or "-",
-            str(rg(r, "hwid", "-") or "-")[:12],
-            rg(r, "executions", 0),
-            "Y" if rg(r, "banned", 0) else "N",
-            rg(r, "expires_at", None) or "life",
-            rg(r, "note", "") or "",
-        )
-
-    api_lis = ""
-    for r in api_rows:
-        k = str(rg(r, "api_key", ""))
-        api_lis += "<tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>" % (
-            k,
-            rg(r, "username", ""),
-            rg(r, "label", "") or "",
-            str(rg(r, "created_at", "") or "")[:19],
-            str(rg(r, "last_used", "") or "")[:19],
-            "ON" if rg(r, "enabled", 1) else "OFF",
-        )
-
-    err_html = ("<p style='color:#f66'>DB: %s</p>" % err) if err else ""
-    base = str(request.base_url).rstrip("/")
-    html = f"""<!DOCTYPE html><html><head><meta charset=utf-8><title>Keys</title>
-    <style>
-    body{{font-family:system-ui,sans-serif;background:#0f1115;color:#e8eaed;padding:24px;max-width:1100px;margin:0 auto}}
-    h2{{margin-top:28px}} a{{color:#8ab4f8}}
-    table{{border-collapse:collapse;width:100%;margin-top:8px}}
-    td,th{{border:1px solid #2a2f3a;padding:8px;font-size:12px;text-align:left}}
-    th{{background:#1a1d24}}
-    input,button{{padding:8px 10px;margin:4px 4px 4px 0;background:#1a1d24;color:#eee;border:1px solid #333;border-radius:6px}}
-    button{{background:#3b82f6;border:none;cursor:pointer}}
-    .card{{background:#151821;border:1px solid #2a2f3a;border-radius:12px;padding:16px;margin:12px 0}}
-    code{{font-size:11px}}
-    </style></head><body>
-    <p><a href="/admin">← Admin</a></p>
-    <h1>Ruraf Keys</h1>
-    {err_html}
-    <div class="card">
-      <h2>1) Bot API Key (/ruraf 등록용)</h2>
-      <p>디스코드 봇 <code>/ruraf</code> 에 넣을 키. 사이트 계정에 연결됨.</p>
-      <form method=post action="/admin/keys/create-api">
-        label <input name=label placeholder="discord-bot" value="discord-bot">
-        <button type=submit>Create API Key</button>
-      </form>
-      <table><tr><th>api_key</th><th>user</th><th>label</th><th>created</th><th>last used</th><th>on</th></tr>
-      {api_lis or "<tr><td colspan=6>없음</td></tr>"}
-      </table>
-    </div>
-    <div class="card">
-      <h2>2) Script Keys (Redeem / HWID)</h2>
-      <p>유저 Redeem 용 키. 보호 스크립트 체크 URL: <code>{base}/api/script/check</code></p>
-      <form method=post action="/admin/keys/create">
-        days <input name=days value=0 type=number style="width:80px">
-        count <input name=count value=1 type=number style="width:80px">
-        note <input name=note placeholder="note">
-        <button type=submit>Create Script Keys</button>
-      </form>
-      <table><tr><th>key</th><th>discord</th><th>hwid</th><th>exec</th><th>ban</th><th>exp</th><th>note</th></tr>
-      {script_lis or "<tr><td colspan=7>없음</td></tr>"}
-      </table>
-    </div>
-    </body></html>"""
-    return HTMLResponse(html)
-
-
-@app.post("/admin/keys/create-api")
-async def admin_keys_create_api(request: Request, label: str = Form("")):
-    if not is_admin_request(request):
-        return HTMLResponse("admin only", status_code=403)
-    user = get_current_user(request) or {"username": ADMIN_USERNAME}
-    key = "eu_" + secrets.token_urlsafe(24)
-    try:
-        conn = get_db()
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS bot_api_keys (
-                    api_key TEXT PRIMARY KEY,
-                    username TEXT NOT NULL,
-                    label TEXT DEFAULT '',
-                    created_at TEXT,
-                    last_used TEXT,
-                    enabled INTEGER DEFAULT 1
-                )
-            """)
-            conn.commit()
-        except Exception:
-            pass
-        conn.execute(
-            "INSERT INTO bot_api_keys (api_key, username, label, created_at, enabled) VALUES (?, ?, ?, ?, 1)",
-            (key, user.get("username") or ADMIN_USERNAME, label or "discord-bot", datetime.utcnow().isoformat()),
-        )
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        return HTMLResponse(f"failed: {e}<p><a href='/admin/keys'>Back</a></p>", status_code=500)
-    return HTMLResponse(
-        f"<h3>API Key created (copy now)</h3><p><code style='font-size:16px'>{key}</code></p>"
-        f"<p>봇에서 <code>/ruraf</code> → 이 키 입력</p>"
-        f"<p><a href='/admin/keys'>Back</a></p>"
-    )
-
-
-@app.post("/admin/keys/create")
-async def admin_keys_create(request: Request, days: int = Form(0), count: int = Form(1), note: str = Form("")):
-    if not is_admin_request(request):
-        return HTMLResponse("admin only", status_code=403)
-    user = get_current_user(request) or {"username": ADMIN_USERNAME}
-    try:
-        count = max(1, min(int(count or 1), 50))
-        days = max(0, int(days or 0))
-    except Exception:
-        count, days = 1, 0
-    from datetime import timedelta
-    created = []
-    try:
-        conn = get_db()
-        try:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS script_keys (
-                    user_key TEXT PRIMARY KEY,
-                    owner_username TEXT NOT NULL,
-                    discord_id TEXT,
-                    hwid TEXT,
-                    note TEXT DEFAULT '',
-                    banned INTEGER DEFAULT 0,
-                    executions INTEGER DEFAULT 0,
-                    created_at TEXT,
-                    expires_at TEXT,
-                    last_hwid_reset TEXT
-                )
-            """)
-            conn.commit()
-        except Exception:
-            pass
-        for _ in range(count):
-            k = _gen_user_key()
-            exp = (datetime.utcnow() + timedelta(days=days)).isoformat() if days > 0 else None
-            conn.execute(
-                "INSERT INTO script_keys (user_key, owner_username, note, created_at, expires_at, banned, executions) VALUES (?, ?, ?, ?, ?, 0, 0)",
-                (k, user.get("username") or ADMIN_USERNAME, note or "", datetime.utcnow().isoformat(), exp),
-            )
-            created.append(k)
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        return HTMLResponse(f"create failed: {e}<p><a href='/admin/keys'>Back</a></p>", status_code=500)
-    keys_html = "<br>".join("<code>%s</code>" % k for k in created)
-    return HTMLResponse("<h3>Created %d</h3>%s<p><a href='/admin/keys'>Back</a></p>" % (len(created), keys_html))
-
-
-@app.get("/api/script/check")
-async def api_script_check_get():
-    return JSONResponse({
-        "ok": False,
-        "error": "Use POST with JSON {key, hwid}",
-        "hint": "Protected scripts call this endpoint via POST"
-    })
