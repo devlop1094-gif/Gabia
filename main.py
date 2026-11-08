@@ -26,7 +26,7 @@ import string
 # ======================
 
 APP_NAME = "Euana"
-VERSION = "1.5.1"
+VERSION = "1.6.0"
 
 # Single domain – shop + obfuscation are different paths (no subdomain)
 # SHOP_PATH = /shop   OBF_PATH = /obfuscate
@@ -391,28 +391,21 @@ def rand_name(length: int = 8) -> str:
 
 
 # ======================
-# Obfuscation Engine (Euana Bytecode VM)
-# Real custom bytecode – no recoverable source string via load()
+# Obfuscation Engine (Euana – universal Lua/Luau)
+# Any source file. Multi-layer encrypted VM envelope.
+# Roblox-safe (no rawget on nil).
 # ======================
 
-# ---- ISA ----
-# Stack machine. Opcodes are randomized per-build.
-# LOADK idx | LOADNIL | LOADBOOL 0/1 | GETGLOBAL idx | SETGLOBAL idx
-# ADD SUB MUL DIV MOD POW CONCAT
-# EQ NE LT LE GT GE | NOT UNM LEN
-# JMP off | JMPIF off | JMPIFNOT off
-# CALL nargs nrets | RETURN n | POP | DUP
-# NEWTABLE | GETTABLE | SETTABLE
-# CLOSURE idx | MOVE (stack rearrange via DUP/POP)
-# HALT
-
 def _rand_ident(n: int = None) -> str:
-    n = n or random.randint(6, 12)
+    n = n or random.randint(8, 16)
     styles = [
-        lambda: "".join(random.choices(string.ascii_lowercase, k=n)),
+        lambda: "".join(random.choices(string.ascii_letters, k=n)),
         lambda: "_" + "".join(random.choices(string.ascii_lowercase + string.digits, k=n)),
         lambda: "".join(random.choices("IlO0o1", k=n)),
-        lambda: "".join(random.choices(string.ascii_letters, k=n)),
+        lambda: "l" + "".join(random.choices("I1l0oO", k=n - 1)),
+        lambda: "".join(random.choices(string.ascii_lowercase, k=3))
+        + str(random.randint(10000, 999999))
+        + "".join(random.choices(string.ascii_letters, k=3)),
     ]
     return random.choice(styles)()
 
@@ -420,1077 +413,324 @@ def _rand_ident(n: int = None) -> str:
 def _num(n: int) -> str:
     n = int(n) & 0xFFFFFFFF
     r = random.random()
-    if 0 <= n < 8 and r < 0.15:
+    if 0 <= n < 8 and r < 0.12:
         return str(n)
-    if r < 0.45:
+    if r < 0.4:
         return "0x" + format(n, "X")
-    if r < 0.8 and n < (1 << 40):
+    if r < 0.75 and n < (1 << 40):
         return "0b" + format(n, "b")
     return "0x" + format(n, "x")
 
 
-def _char_arr(s: str) -> str:
-    return ",".join(str(ord(c)) for c in s)
+def _opaque_true() -> str:
+    a = random.randint(2, 31)
+    b = random.randint(3, 40)
+    forms = [
+        f"(function() local a = {_num(a)} return a * a >= {_num(0)} end)()",
+        f"(function() local a = {_num(a)} return (a + a) == (a * {_num(2)}) end)()",
+        f"(function() local a = {_num(a)} return not (a * a < {_num(0)}) end)()",
+        f"(function() local a = {_num(a)} local b = {_num(b)} return (a * b) == (b * a) end)()",
+        f"(function() local a = {_num(a)} return type(a) == \"number\" end)()",
+        f"(function() local a = {_num(a)} return #tostring(a) > {_num(0)} end)()",
+    ]
+    return random.choice(forms)
 
 
-# ---------- Tokenizer (Lua subset) ----------
-_TOKEN_RE = re.compile(
-    r"""
-    (\-\-\[\=(?=\[)|(?P<longcomment>\-\-\[\[.*?\]\])|
-    (?P<comment>\-\-[^\n]*)|
-    (?P<longstr>\[(=*)\[.*?\]\2\])|
-    (?P<str>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')|
-    (?P<num>0[xX][0-9A-Fa-f]+|0[bB][01]+|\d+\.?\d*(?:[eE][+-]?\d+)?)|
-    (?P<name>[A-Za-z_][A-Za-z0-9_]*)|
-    (?P<op>\.\.\.|==|~=|<=|>=||\.\.|[\+\-\*/%\^#<>\(\)\[\]\{\},=\.;:])|
-    (?P<ws>\s+)
-    )""",
-    re.VERBOSE | re.DOTALL,
-)
-
-_KEYWORDS = {
-    "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
-    "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return",
-    "then", "true", "until", "while",
-}
+def _opaque_false() -> str:
+    a = random.randint(2, 20)
+    return random.choice([
+        f"(function() local a = {_num(a)} return a * a < {_num(0)} end)()",
+        f"(function() local a = {_num(a)} return a ~= a end)()",
+        f"(function() return false and {_num(a)} end)()",
+    ])
 
 
-def _tokenize(src: str):
-    tokens = []
-    pos = 0
-    while pos < len(src):
-        # skip short comments
-        if src.startswith("--", pos) and not src.startswith("--[[", pos) and not src.startswith("--[=", pos):
-            nl = src.find("\n", pos)
-            pos = len(src) if nl < 0 else nl + 1
-            continue
-        # long comment
-        if src.startswith("--[[", pos):
-            endc = src.find("]]", pos + 4)
-            pos = len(src) if endc < 0 else endc + 2
-            continue
-        m = None
-        # long string
-        if src[pos] == "[":
-            eq = 0
-            p2 = pos + 1
-            while p2 < len(src) and src[p2] == "=":
-                eq += 1
-                p2 += 1
-            if p2 < len(src) and src[p2] == "[":
-                close = "]" + ("=" * eq) + "]"
-                endc = src.find(close, p2 + 1)
-                if endc >= 0:
-                    tokens.append(("str", src[p2 + 1:endc]))
-                    pos = endc + len(close)
-                    continue
-        ch = src[pos]
-        if ch in " \t\r\n":
-            pos += 1
-            continue
-        if ch in "\"'":
-            q = ch
-            j = pos + 1
-            buf = []
-            while j < len(src) and src[j] != q:
-                if src[j] == "\\" and j + 1 < len(src):
-                    buf.append(src[j:j+2])
-                    j += 2
-                else:
-                    buf.append(src[j])
-                    j += 1
-            tokens.append(("str", "".join(buf)))
-            pos = j + 1 if j < len(src) else j
-            continue
-        if ch.isdigit() or (ch == "." and pos + 1 < len(src) and src[pos+1].isdigit()):
-            j = pos
-            if src[j:j+2].lower() == "0x":
-                j += 2
-                while j < len(src) and src[j] in "0123456789abcdefABCDEF":
-                    j += 1
-            elif src[j:j+2].lower() == "0b":
-                j += 2
-                while j < len(src) and src[j] in "01":
-                    j += 1
-            else:
-                while j < len(src) and (src[j].isdigit() or src[j] == "."):
-                    j += 1
-            tokens.append(("num", src[pos:j]))
-            pos = j
-            continue
-        if ch.isalpha() or ch == "_":
-            j = pos
-            while j < len(src) and (src[j].isalnum() or src[j] == "_"):
-                j += 1
-            word = src[pos:j]
-            if word in _KEYWORDS:
-                tokens.append((word, word))
-            else:
-                tokens.append(("name", word))
-            pos = j
-            continue
-        # multi-char ops
-        for op in ("...", "..", "==", "~=", "<=", ">="):
-            if src.startswith(op, pos):
-                tokens.append((op, op))
-                pos += len(op)
-                break
-        else:
-            tokens.append((ch, ch))
-            pos += 1
-    tokens.append(("EOF", "EOF"))
-    return tokens
+def _junk_block() -> str:
+    a, b, c = _rand_ident(), _rand_ident(), _rand_ident()
+    n1, n2, n3 = random.randint(1, 9999), random.randint(1, 9999), random.randint(100, 99999)
+    forms = [
+        f"do local {a} = {_num(n1)} local {b} = {_num(n2)} if {a} * {a} < {_num(0)} then {b} = {b} + {_num(1)} end end",
+        f"do local {a} = {_num(n1)} local {b} = {_num(n2)} local {c} = {_num(n3)} if ({a} + {b}) * {c} < {_num(0)} then {c} = {c} + {_num(7)} end end",
+        f"do local {a} = {_num(n1)} for {b} = 1, {_num(random.randint(2, 4))} do if {a} * {a} < {_num(0)} then {a} = {a} + {_num(1)} end end end",
+        f"do local {a} = {_num(n1)} local {b} = ({_num(n2)} ~ {_num(n3)}) if type({a}) ~= \"number\" then {b} = {b} + {_num(1)} end end",
+    ]
+    return random.choice(forms)
 
 
-# ---------- Compiler ----------
-class _Compiler:
-    def __init__(self):
-        self.tokens = []
-        self.p = 0
-        self.code = []  # list of ints / markers
-        self.constants = []  # pool
-        self.const_map = {}
-        self.errors = 0
-        # per-build opcode map
-        base = list(range(1, 80))
-        random.shuffle(base)
-        names = [
-            "LOADK", "LOADNIL", "LOADBOOL", "GETGLOBAL", "SETGLOBAL",
-            "ADD", "SUB", "MUL", "DIV", "MOD", "POW", "CONCAT",
-            "EQ", "NE", "LT", "LE", "GT", "GE",
-            "NOT", "UNM", "LEN",
-            "JMP", "JMPIF", "JMPIFNOT",
-            "CALL", "RETURN", "POP", "DUP",
-            "NEWTABLE", "GETTABLE", "SETTABLE",
-            "HALT", "MOVELOCAL", "GETLOCAL", "SETLOCAL",
-            "CLOSURE", "FORPREP", "FORLOOP",
-            "LOADVARARG", "SELF",
-        ]
-        self.OP = {n: base[i] for i, n in enumerate(names)}
-        self.locals_stack = [{}]  # name -> slot
-        self.local_count = [0]
-
-    def intern(self, v):
-        key = (type(v).__name__, v)
-        if key in self.const_map:
-            return self.const_map[key]
-        idx = len(self.constants)
-        self.constants.append(v)
-        self.const_map[key] = idx
-        return idx
-
-    def emit(self, *ops):
-        self.code.extend(ops)
-
-    def cur(self):
-        return self.tokens[self.p]
-
-    def at(self, *kinds):
-        return self.cur()[0] in kinds
-
-    def eat(self, kind=None):
-        t = self.cur()
-        if kind and t[0] != kind:
-            self.errors += 1
-            return t
-        self.p += 1
-        return t
-
-    def push_scope(self):
-        self.locals_stack.append({})
-        self.local_count.append(self.local_count[-1])
-
-    def pop_scope(self):
-        self.locals_stack.pop()
-        self.local_count.pop()
-
-    def new_local(self, name):
-        slot = self.local_count[-1]
-        self.local_count[-1] = slot + 1
-        self.locals_stack[-1][name] = slot
-        return slot
-
-    def find_local(self, name):
-        for scope in reversed(self.locals_stack):
-            if name in scope:
-                return scope[name]
-        return None
-
-    def compile(self, src: str):
-        self.tokens = _tokenize(src)
-        self.p = 0
-        self.block()
-        self.emit(self.OP["HALT"])
-        return self.code, self.constants, self.OP
-
-    def block(self):
-        while not self.at("EOF", "end", "else", "elseif", "until"):
-            if self.at("EOF"):
-                break
-            self.stat()
-
-    def stat(self):
-        if self.at("local"):
-            self.eat("local")
-            if self.at("function"):
-                self.eat("function")
-                name = self.eat("name")[1]
-                slot = self.new_local(name)
-                self.function_body()
-                self.emit(self.OP["SETLOCAL"], slot)
-            else:
-                names = []
-                names.append(self.eat("name")[1])
-                while self.at(","):
-                    self.eat(",")
-                    names.append(self.eat("name")[1])
-                slots = [self.new_local(n) for n in names]
-                if self.at("="):
-                    self.eat("=")
-                    nexp = 0
-                    self.exp()
-                    nexp = 1
-                    while self.at(","):
-                        self.eat(",")
-                        self.exp()
-                        nexp += 1
-                    # align
-                    while nexp < len(slots):
-                        self.emit(self.OP["LOADNIL"])
-                        nexp += 1
-                    for sl in reversed(slots):
-                        self.emit(self.OP["SETLOCAL"], sl)
-                else:
-                    for sl in slots:
-                        self.emit(self.OP["LOADNIL"])
-                        self.emit(self.OP["SETLOCAL"], sl)
-        elif self.at("function"):
-            self.eat("function")
-            name = self.eat("name")[1]
-            self.function_body()
-            # global function
-            idx = self.intern(name)
-            self.emit(self.OP["SETGLOBAL"], idx)
-        elif self.at("if"):
-            self.if_stat()
-        elif self.at("while"):
-            self.while_stat()
-        elif self.at("return"):
-            self.eat("return")
-            n = 0
-            if not self.at("EOF", "end", "else", "elseif", "until", ";"):
-                self.exp()
-                n = 1
-                while self.at(","):
-                    self.eat(",")
-                    self.exp()
-                    n += 1
-            self.emit(self.OP["RETURN"], n)
-        elif self.at("do"):
-            self.eat("do")
-            self.push_scope()
-            self.block()
-            self.pop_scope()
-            self.eat("end")
-        elif self.at("break"):
-            self.eat("break")
-            # approximate: jump nowhere special – treat as return nil
-            self.emit(self.OP["LOADNIL"])
-            self.emit(self.OP["RETURN"], 1)
-        elif self.at(";"):
-            self.eat(";")
-        elif self.at("name"):
-            # assignment or call
-            self.prefix_stat()
-        else:
-            # try expression statement (call)
-            try:
-                self.exp()
-                self.emit(self.OP["POP"])
-            except Exception:
-                self.errors += 1
-                self.p += 1
-
-    def prefix_stat(self):
-        name = self.eat("name")[1]
-        # call: name ( args )
-        if self.at("("):
-            idx = self.intern(name)
-            loc = self.find_local(name)
-            if loc is not None:
-                self.emit(self.OP["GETLOCAL"], loc)
-            else:
-                self.emit(self.OP["GETGLOBAL"], idx)
-            nargs = self.call_args()
-            self.emit(self.OP["CALL"], nargs, 0)
-        elif self.at("="):
-            # global/local assign
-            self.eat("=")
-            self.exp()
-            loc = self.find_local(name)
-            if loc is not None:
-                self.emit(self.OP["SETLOCAL"], loc)
-            else:
-                self.emit(self.OP["SETGLOBAL"], self.intern(name))
-        elif self.at("."):
-            # name.field = or name.field(
-            loc = self.find_local(name)
-            if loc is not None:
-                self.emit(self.OP["GETLOCAL"], loc)
-            else:
-                self.emit(self.OP["GETGLOBAL"], self.intern(name))
-            while self.at("."):
-                self.eat(".")
-                field = self.eat("name")[1]
-                if self.at("="):
-                    self.eat("=")
-                    self.exp()
-                    self.emit(self.OP["LOADK"], self.intern(field))
-                    # stack: tbl, val, key -> need tbl, key, val
-                    self.emit(self.OP["SETTABLE"])
-                    return
-                elif self.at("("):
-                    self.emit(self.OP["LOADK"], self.intern(field))
-                    self.emit(self.OP["GETTABLE"])
-                    nargs = self.call_args()
-                    self.emit(self.OP["CALL"], nargs, 0)
-                    return
-                else:
-                    self.emit(self.OP["LOADK"], self.intern(field))
-                    self.emit(self.OP["GETTABLE"])
-        elif self.at(","):
-            # multi assign name, name = ...
-            names = [name]
-            while self.at(","):
-                self.eat(",")
-                names.append(self.eat("name")[1])
-            self.eat("=")
-            for _ in names:
-                self.exp()
-                if self.at(","):
-                    self.eat(",")
-            for nm in reversed(names):
-                loc = self.find_local(nm)
-                if loc is not None:
-                    self.emit(self.OP["SETLOCAL"], loc)
-                else:
-                    self.emit(self.OP["SETGLOBAL"], self.intern(nm))
-        else:
-            # bare name – treat as get+pop
-            loc = self.find_local(name)
-            if loc is not None:
-                self.emit(self.OP["GETLOCAL"], loc)
-            else:
-                self.emit(self.OP["GETGLOBAL"], self.intern(name))
-            self.emit(self.OP["POP"])
-
-    def call_args(self):
-        self.eat("(")
-        n = 0
-        if not self.at(")"):
-            self.exp()
-            n = 1
-            while self.at(","):
-                self.eat(",")
-                self.exp()
-                n += 1
-        self.eat(")")
-        return n
-
-    def function_body(self):
-        self.eat("(")
-        params = []
-        if not self.at(")"):
-            params.append(self.eat("name")[1])
-            while self.at(","):
-                self.eat(",")
-                params.append(self.eat("name")[1])
-        self.eat(")")
-        # compile body as separate proto – simplified: inline with local params
-        # For true closures we'd nest protos; here we use a simple approach:
-        # emit CLOSURE with index into nested code table – keep flat for subset
-        # Simplified: treat function as creating a lua function via nested compile
-        # FALLBACK for nested functions: store body source – avoid
-        # Instead: emit a closure marker and compile body into main stream with JMP
-        start_jmp = len(self.code)
-        self.emit(self.OP["JMP"], 0)  # skip body
-        body_start = len(self.code)
-        self.push_scope()
-        for i, pm in enumerate(params):
-            sl = self.new_local(pm)
-            # args are on stack when called – VM CALL will place them
-        self.block()
-        self.emit(self.OP["LOADNIL"])
-        self.emit(self.OP["RETURN"], 1)
-        self.pop_scope()
-        body_end = len(self.code)
-        # patch jump
-        self.code[start_jmp + 1] = body_end - (start_jmp + 2)
-        # push closure pointing to body_start
-        self.emit(self.OP["CLOSURE"], body_start, len(params))
-
-    def if_stat(self):
-        self.eat("if")
-        self.exp()
-        self.eat("then")
-        j_false = len(self.code)
-        self.emit(self.OP["JMPIFNOT"], 0)
-        self.push_scope()
-        self.block()
-        self.pop_scope()
-        jumps_end = []
-        if self.at("else") or self.at("elseif"):
-            je = len(self.code)
-            self.emit(self.OP["JMP"], 0)
-            jumps_end.append(je)
-            self.code[j_false + 1] = len(self.code) - (j_false + 2)
-            while self.at("elseif"):
-                self.eat("elseif")
-                self.exp()
-                self.eat("then")
-                jf = len(self.code)
-                self.emit(self.OP["JMPIFNOT"], 0)
-                self.push_scope()
-                self.block()
-                self.pop_scope()
-                je = len(self.code)
-                self.emit(self.OP["JMP"], 0)
-                jumps_end.append(je)
-                self.code[jf + 1] = len(self.code) - (jf + 2)
-            if self.at("else"):
-                self.eat("else")
-                self.push_scope()
-                self.block()
-                self.pop_scope()
-        else:
-            self.code[j_false + 1] = len(self.code) - (j_false + 2)
-        self.eat("end")
-        for je in jumps_end:
-            self.code[je + 1] = len(self.code) - (je + 2)
-
-    def while_stat(self):
-        self.eat("while")
-        start = len(self.code)
-        self.exp()
-        self.eat("do")
-        jf = len(self.code)
-        self.emit(self.OP["JMPIFNOT"], 0)
-        self.push_scope()
-        self.block()
-        self.pop_scope()
-        self.eat("end")
-        self.emit(self.OP["JMP"], start - (len(self.code) + 2))
-        self.code[jf + 1] = len(self.code) - (jf + 2)
-
-    # expression parser (precedence climbing)
-    def exp(self):
-        self.exp_or()
-
-    def exp_or(self):
-        self.exp_and()
-        while self.at("or"):
-            self.eat("or")
-            # short-circuit: if true skip
-            self.emit(self.OP["DUP"])
-            j = len(self.code)
-            self.emit(self.OP["JMPIF"], 0)
-            self.emit(self.OP["POP"])
-            self.exp_and()
-            self.code[j + 1] = len(self.code) - (j + 2)
-
-    def exp_and(self):
-        self.exp_cmp()
-        while self.at("and"):
-            self.eat("and")
-            self.emit(self.OP["DUP"])
-            j = len(self.code)
-            self.emit(self.OP["JMPIFNOT"], 0)
-            self.emit(self.OP["POP"])
-            self.exp_cmp()
-            self.code[j + 1] = len(self.code) - (j + 2)
-
-    def exp_cmp(self):
-        self.exp_concat()
-        while self.at("==", "~=", "<", ">", "<=", ">="):
-            op = self.eat()[0]
-            self.exp_concat()
-            m = {"==": "EQ", "~=": "NE", "<": "LT", ">": "GT", "<=": "LE", ">=": "GE"}
-            self.emit(self.OP[m[op]])
-
-    def exp_concat(self):
-        self.exp_add()
-        while self.at(".."):
-            self.eat("..")
-            self.exp_add()
-            self.emit(self.OP["CONCAT"])
-
-    def exp_add(self):
-        self.exp_mul()
-        while self.at("+", "-"):
-            op = self.eat()[0]
-            self.exp_mul()
-            self.emit(self.OP["ADD"] if op == "+" else self.OP["SUB"])
-
-    def exp_mul(self):
-        self.exp_unary()
-        while self.at("*", "/", "%"):
-            op = self.eat()[0]
-            self.exp_unary()
-            if op == "*":
-                self.emit(self.OP["MUL"])
-            elif op == "/":
-                self.emit(self.OP["DIV"])
-            else:
-                self.emit(self.OP["MOD"])
-
-    def exp_unary(self):
-        if self.at("not", "-", "#"):
-            op = self.eat()[0]
-            self.exp_unary()
-            self.emit(self.OP[{"not": "NOT", "-": "UNM", "#": "LEN"}[op]])
-        else:
-            self.exp_pow()
-
-    def exp_pow(self):
-        self.exp_primary()
-        if self.at("^"):
-            self.eat("^")
-            self.exp_unary()
-            self.emit(self.OP["POW"])
-
-    def exp_primary(self):
-        if self.at("num"):
-            v = self.eat("num")[1]
-            try:
-                if v.lower().startswith("0x"):
-                    num = int(v, 16)
-                elif v.lower().startswith("0b"):
-                    num = int(v, 2)
-                elif "." in v or "e" in v.lower():
-                    num = float(v)
-                else:
-                    num = int(v)
-            except Exception:
-                num = 0
-            self.emit(self.OP["LOADK"], self.intern(num))
-        elif self.at("str"):
-            s = self.eat("str")[1]
-            # unescape basic
-            s = s.replace("\\n", "\n").replace("\\t", "\t").replace("\\\"", "\"").replace("\\'", "'").replace("\\\\", "\\")
-            self.emit(self.OP["LOADK"], self.intern(s))
-        elif self.at("nil"):
-            self.eat("nil")
-            self.emit(self.OP["LOADNIL"])
-        elif self.at("true"):
-            self.eat("true")
-            self.emit(self.OP["LOADBOOL"], 1)
-        elif self.at("false"):
-            self.eat("false")
-            self.emit(self.OP["LOADBOOL"], 0)
-        elif self.at("function"):
-            self.eat("function")
-            self.function_body()
-        elif self.at("{"):
-            self.table_constructor()
-        elif self.at("("):
-            self.eat("(")
-            self.exp()
-            self.eat(")")
-        elif self.at("name"):
-            name = self.eat("name")[1]
-            loc = self.find_local(name)
-            if loc is not None:
-                self.emit(self.OP["GETLOCAL"], loc)
-            else:
-                self.emit(self.OP["GETGLOBAL"], self.intern(name))
-            # suffix
-            while True:
-                if self.at("."):
-                    self.eat(".")
-                    field = self.eat("name")[1]
-                    self.emit(self.OP["LOADK"], self.intern(field))
-                    self.emit(self.OP["GETTABLE"])
-                elif self.at("["):
-                    self.eat("[")
-                    self.exp()
-                    self.eat("]")
-                    self.emit(self.OP["GETTABLE"])
-                elif self.at("("):
-                    nargs = self.call_args()
-                    self.emit(self.OP["CALL"], nargs, 1)
-                elif self.at(":"):
-                    self.eat(":")
-                    method = self.eat("name")[1]
-                    self.emit(self.OP["LOADK"], self.intern(method))
-                    self.emit(self.OP["SELF"])  # pushes obj, method
-                    nargs = self.call_args()
-                    self.emit(self.OP["CALL"], nargs + 1, 1)
-                else:
-                    break
-        else:
-            self.errors += 1
-            self.emit(self.OP["LOADNIL"])
-            if not self.at("EOF"):
-                self.p += 1
-
-    def table_constructor(self):
-        self.eat("{")
-        self.emit(self.OP["NEWTABLE"])
-        idx = 1
-        while not self.at("}", "EOF"):
-            if self.at("name") and self.p + 1 < len(self.tokens) and self.tokens[self.p+1][0] == "=":
-                k = self.eat("name")[1]
-                self.eat("=")
-                self.exp()
-                self.emit(self.OP["LOADK"], self.intern(k))
-                self.emit(self.OP["SETTABLE"])
-            elif self.at("["):
-                self.eat("[")
-                self.exp()
-                self.eat("]")
-                self.eat("=")
-                self.exp()
-                # stack: tbl, key, val – SETTABLE expects tbl, val, key in our impl – fix in VM
-                self.emit(self.OP["SETTABLE"])
-            else:
-                self.exp()
-                self.emit(self.OP["LOADK"], self.intern(idx))
-                self.emit(self.OP["SETTABLE"])
-                idx += 1
-            if self.at(",", ";"):
-                self.eat()
-            else:
-                break
-        if self.at("}"):
-            self.eat("}")
-
-
-def _compile_source(src: str):
-    """Return (bytecode_list, constants, op_map, ok)."""
-    c = _Compiler()
-    try:
-        code, constants, op = c.compile(src)
-        ok = c.errors == 0 and len(code) > 1
-        return code, constants, op, ok
-    except Exception:
-        return [], [], {}, False
-
-
-def _encode_bc(data: bytes, key: bytes):
-    out = bytearray(len(data))
-    state = int.from_bytes(key[:4].ljust(4, b"\0"), "little") or 1
-    for i, b in enumerate(data):
-        state = (state * 1664525 + 1013904223) & 0xFFFFFFFF
-        out[i] = b ^ key[i % len(key)] ^ ((state >> 16) & 0xFF) ^ ((i * 131) & 0xFF)
-    return bytes(out)
-
-
-def _pack_program(code, constants):
-    """Pack bytecode + constants into a binary blob."""
+def _anti_bundle(intensity: str) -> str:
+    """var / function / local / VM anti-deobf."""
     parts = []
-    # header: nconst, ncode
-    parts.append(len(constants).to_bytes(4, "little"))
-    parts.append(len(code).to_bytes(4, "little"))
-    for c in constants:
-        if c is None:
-            parts.append(bytes([0]))  # nil
-        elif isinstance(c, bool):
-            parts.append(bytes([1, 1 if c else 0]))
-        elif isinstance(c, (int, float)):
-            # number as string for simplicity
-            s = str(c).encode("utf-8")
-            parts.append(bytes([2, len(s) & 0xFF, (len(s) >> 8) & 0xFF]) + s)
-        else:
-            s = str(c).encode("utf-8")
-            parts.append(bytes([3, len(s) & 0xFF, (len(s) >> 8) & 0xFF]) + s)
-    # code as u16 sequence
-    for op in code:
-        op = int(op) & 0xFFFF
-        parts.append(bytes([op & 0xFF, (op >> 8) & 0xFF]))
-    return b"".join(parts)
-
-
-def _b85(data: bytes):
-    alphabet = list(
-        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+./:;<=>?@[]^_{|}~"
+    # always: decoy locals
+    ids = [_rand_ident() for _ in range(6)]
+    nums = [random.randint(0x1000, 0xFFFFFF) for _ in range(6)]
+    parts.append(f"local {ids[0]} = {_num(nums[0])}")
+    parts.append(f"local {ids[1]} = {_num(nums[1])}")
+    parts.append(f"local {ids[2]} = {{ [{_num(1)}] = {ids[0]} , [{_num(2)}] = {ids[1]} }}")
+    parts.append(f"local {ids[3]} = {ids[2]}[{_num(1)}]")
+    parts.append(
+        f"if {ids[3]} ~= {ids[0]} and {_opaque_true()} then {ids[0]} = {ids[3]} end"
     )
-    random.shuffle(alphabet)
-    alph = "".join(alphabet)
-    base = len(alph)
-    pad = (4 - len(data) % 4) % 4
-    data = data + bytes(pad)
-    out = []
+    # function anti
+    f1, f2 = _rand_ident(), _rand_ident()
+    parts.append(f"local {f1} = function() return {_num(random.randint(1, 9))} end")
+    parts.append(f"local {f2} = function(...) return {f1}() end")
+    parts.append(
+        f"if type({f1}) ~= \"function\" or type({f2}) ~= \"function\" then while true do end end"
+    )
+    if intensity in ("v2", "v3"):
+        parts.append(_junk_block())
+        parts.append(_junk_block())
+        # VM integrity (Roblox-safe: use globals directly)
+        parts.append(
+            "if type(setmetatable) ~= \"function\" or type(string) ~= \"table\" "
+            "or type(string.char) ~= \"function\" or type(table.concat) ~= \"function\" "
+            "then while true do end end"
+        )
+        parts.append(
+            f"if {_opaque_false()} then {f2}({_num(0)}) while true do end end"
+        )
+    if intensity == "v3":
+        parts.append(_junk_block())
+        parts.append(
+            "do local _t = type if _t(_t) ~= \"function\" then while true do end end end"
+        )
+        # more decoys
+        for _ in range(3):
+            parts.append(
+                f"do local {_rand_ident()} = {_num(random.randint(10, 99999))} end"
+            )
+    return " ".join(parts)
+
+
+def _b85_alphabet() -> str:
+    return (
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+        "!#$%&()*+./:;<=>?@[]^_{|}~"
+    )
+
+
+def _encode_payload(data: bytes, key: bytes):
+    alphabet_list = list(_b85_alphabet())
+    random.shuffle(alphabet_list)
+    alphabet = "".join(alphabet_list)
+    base = len(alphabet)
+    out = bytearray(len(data))
+    for i, b in enumerate(data):
+        out[i] = b ^ key[i % len(key)] ^ ((i * 131) & 0xFF)
+    pad = (4 - (len(out) % 4)) % 4
+    out = out + bytes(pad)
+    encoded = []
     i = 0
-    while i < len(data):
-        n = data[i] | (data[i+1] << 8) | (data[i+2] << 16) | (data[i+3] << 24)
+    while i < len(out):
+        n = out[i] | (out[i + 1] << 8) | (out[i + 2] << 16) | (out[i + 3] << 24)
         i += 4
         for _ in range(5):
-            out.append(alph[n % base])
+            encoded.append(alphabet[n % base])
             n //= base
-    return "".join(out), alph, pad
+    payload = "EUN" + "".join(encoded)
+    used = list(sorted(set(payload)))
+    vals = used[:]
+    random.shuffle(vals)
+    sub = {used[i]: vals[i] for i in range(len(used))}
+    scrambled = "".join(sub[c] for c in payload)
+    inv = {v: k for k, v in sub.items()}
+    return scrambled, inv, alphabet, pad
 
 
-def _emit_vm_runtime(blob_b85: str, alph: str, pad: int, key: bytes, op: dict, intensity: str) -> str:
-    """Emit Lua VM that interprets our bytecode. No source load of user code."""
-    N = {k: _rand_ident() for k in (
-        "rg", "env", "char", "sub", "concat", "floor", "pack", "unpack",
-        "pcall", "type", "error", "setmt", "rawget", "rawset", "tostring",
-        "tonumber", "select", "bxor", "dec", "vm", "st", "sp", "pc", "bc",
-        "kn", "locals", "run", "decode", "K", "code", "mt",
-    )}
+def _rename_vars(src: str) -> str:
+    """Best-effort rename; never breaks exotic syntax – skip on failure."""
+    reserved = {
+        "and", "break", "do", "else", "elseif", "end", "false", "for", "function",
+        "goto", "if", "in", "local", "nil", "not", "or", "repeat", "return",
+        "then", "true", "until", "while", "self", "_G", "_ENV", "pairs", "ipairs",
+        "print", "type", "tostring", "tonumber", "require", "pcall", "xpcall",
+        "error", "assert", "select", "unpack", "next", "rawget", "rawset",
+        "setmetatable", "getmetatable", "string", "table", "math", "bit32",
+        "coroutine", "buffer", "task", "game", "workspace", "script",
+        "load", "loadstring", "typeof", "continue", "export", "type",
+    }
+    # skip aggressive rename for huge/complex files – safety
+    if len(src) > 200_000:
+        return src
+    mapping = {}
 
-    key_tbl = "{" + ",".join(str(b) for b in key) + "}"
-    eq = "="
-    while f"]{eq}]" in blob_b85:
-        eq += "="
-    payload = f"[{eq}[{blob_b85}]{eq}]"
-    alph_esc = alph.replace("\\", "\\\\").replace('"', '\\"')
+    def new_name():
+        return _rand_ident(random.randint(10, 16))
 
-    # randomized op numbers as locals
-    op_locals = "\n".join(f"local OP_{k} = {_num(v)}" for k, v in op.items())
+    try:
+        def ren_func(m):
+            prefix, name = m.group(1), m.group(2)
+            if name in reserved or len(name) <= 1:
+                return m.group(0)
+            if name not in mapping:
+                mapping[name] = new_name()
+            return f"{prefix}{mapping[name]}"
 
-    # heavy anti: var / function / code / VM
-    a1, a2, a3, a4 = _rand_ident(), _rand_ident(), _rand_ident(), _rand_ident()
-    f1, f2, f3 = _rand_ident(), _rand_ident(), _rand_ident()
-    v1, v2, v3, v4, v5 = _rand_ident(), _rand_ident(), _rand_ident(), _rand_ident(), _rand_ident()
-    anti = f"""
-do
-local {v1} = {_num(random.randint(1000,99999))}
-local {v2} = {_num(random.randint(1000,99999))}
-local {v3} = {{ [{_num(1)}] = {v1} , [{_num(2)}] = {v2} }}
-local {v4} = {v3}[{_num(1)}]
-local {v5} = (function(x) return x end)({v4})
-if {v5} ~= {v1} then while true do end end
-local {f1} = function() return {_num(random.randint(1,9))} end
-local {f2} = function(...) return {f1}() end
-if type({f1}) ~= "function" or type({f2}) ~= "function" then while true do end end
-if type(tostring({f1})) ~= "string" then while true do end end
-local {a1} = type
-if {a1}({a1}) ~= "function" then while true do end end
-if {a1}(setmetatable) ~= "function" then while true do end end
-if {a1}(string.char) ~= "function" then while true do end end
-if {a1}(table.concat) ~= "function" then while true do end end
-if {a1}(rawget) ~= "function" then while true do end end
-local {a2} = string.char({_num(65)},{_num(66)},{_num(67)})
-if #{a2} ~= {_num(3)} then while true do end end
-local {a3} = setmetatable
-local {a4} = {{}}
-if {a1}({a3}({a4}, {{}})) ~= "table" then while true do end end
-if (function() local z = {_num(random.randint(2,20))} return z * z < {_num(0)} end)() then
-  {f2}({_num(0)})
-  while true do end
-end
-end
-"""
+        src = re.sub(
+            r"\b(local\s+function\s+|function\s+)([A-Za-z_][A-Za-z0-9_]*)",
+            ren_func,
+            src,
+        )
 
-    body = f"""
-local {N['rg']} = rawget
-local {N['env']} = (type(_G) == "table" and _G) or {{}}
-local function {N['rawget']}(t, k)
-  if type(t) ~= "table" then return nil end
-  return {N['rg']}(t, k)
-end
-local _S = string or {N['rawget']}({N['env']}, "string") or {{}}
-local _T = table or {N['rawget']}({N['env']}, "table") or {{}}
-local _M = math or {N['rawget']}({N['env']}, "math") or {{}}
-local {N['char']} = _S.char or string.char
-local {N['sub']} = _S.sub or string.sub
-local {N['concat']} = _T.concat or table.concat
-local {N['floor']} = _M.floor or math.floor
-local {N['pack']} = _T.pack or table.pack or function(...) return {{n = select("#", ...), ...}} end
-local {N['unpack']} = _T.unpack or table.unpack or unpack
-local {N['pcall']} = pcall
-local {N['type']} = type
-local {N['error']} = error
-local {N['setmt']} = setmetatable
-local {N['rawset']} = rawset
-local {N['tostring']} = tostring
-local {N['tonumber']} = tonumber
-local {N['select']} = select
-{anti}
-local function {N['bxor']}(a, b)
-  a = {N['floor']}(a) % 256; b = {N['floor']}(b) % 256
-  local r, p = 0, 1
-  for _ = 1, 8 do
-    local ba, bb = a % 2, b % 2
-    r = r + ((ba + bb) % 2) * p
-    a = {N['floor']}(a / 2); b = {N['floor']}(b / 2); p = p * 2
-  end
-  return r
-end
-local function {N['decode']}(blob, alpha, key, pad)
-  local base = #alpha
-  local idx = {{}}
-  for i = 1, base do idx[{N['sub']}(alpha, i, i)] = i - 1 end
-  local digits = {{}}
-  for i = 1, #blob do digits[#digits + 1] = idx[{N['sub']}(blob, i, i)] end
-  local bytes = {{}}
-  local di = 1
-  while di + 4 <= #digits do
-    local n, p = 0, 1
-    for j = 0, 4 do n = n + (digits[di + j] or 0) * p; p = p * base end
-    di = di + 5
-    for j = 0, 3 do bytes[#bytes + 1] = n % 256; n = {N['floor']}(n / 256) end
-  end
-  if pad > 0 then for i = 1, pad do bytes[#bytes] = nil end end
-  local state = key[1] + key[2] * 256 + key[3] * 65536 + key[4] * 16777216
-  if state == 0 then state = 1 end
-  local out = {{}}
-  for i = 1, #bytes do
-    state = (state * 1664525 + 1013904223) % 4294967296
-    local k = {N['floor']}(state / 65536) % 256
-    out[i] = {N['bxor']}({N['bxor']}(bytes[i], key[((i - 1) % #key) + 1]), {N['bxor']}(k, (i - 1) * 131 % 256))
-  end
-  return out
-end
-{op_locals}
-local {N['K']} = {payload}
-local ALPHA = "{alph_esc}"
-local KEY = {key_tbl}
-local PAD = {_num(pad)}
-local bytes = {N['decode']}({N['K']}, ALPHA, KEY, PAD)
--- unpack constants + code
-local function u16(i)
-  return bytes[i] + bytes[i + 1] * 256
-end
-local function u8(i) return bytes[i] end
-local off = 1
-local nconst = bytes[off] + bytes[off+1]*256 + bytes[off+2]*65536 + bytes[off+3]*16777216; off = off + 4
-local ncode = bytes[off] + bytes[off+1]*256 + bytes[off+2]*65536 + bytes[off+3]*16777216; off = off + 4
-local {N['kn']} = {{}}
-for ci = 1, nconst do
-  local tag = bytes[off]; off = off + 1
-  if tag == 0 then
-    {N['kn']}[ci] = nil
-  elseif tag == 1 then
-    {N['kn']}[ci] = bytes[off] ~= 0; off = off + 1
-  elseif tag == 2 or tag == 3 then
-    local ln = bytes[off] + bytes[off+1]*256; off = off + 2
-    local chars = {{}}
-    for j = 0, ln - 1 do chars[j+1] = {N['char']}(bytes[off + j]) end
-    off = off + ln
-    local s = {N['concat']}(chars)
-    if tag == 2 then {N['kn']}[ci] = {N['tonumber']}(s) else {N['kn']}[ci] = s end
-  end
-end
-local {N['code']} = {{}}
-for ci = 1, ncode do
-  {N['code']}[ci] = u16(off); off = off + 2
-end
-local function {N['vm']}(...)
-  local {N['st']} = {{}}
-  local {N['sp']} = 0
-  local {N['pc']} = 1
-  local {N['locals']} = {{}}
-  local function push(v) {N['sp']} = {N['sp']} + 1; {N['st']}[{N['sp']}] = v end
-  local function pop() local v = {N['st']}[{N['sp']}]; {N['st']}[{N['sp']}] = nil; {N['sp']} = {N['sp']} - 1; return v end
-  local args = {N['pack']}(...)
-  while {N['pc']} <= ncode do
-    local op = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-    if op == OP_LOADK then
-      local idx = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      push({N['kn']}[idx + 1])
-    elseif op == OP_LOADNIL then
-      push(nil)
-    elseif op == OP_LOADBOOL then
-      local v = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      push(v ~= 0)
-    elseif op == OP_GETGLOBAL then
-      local idx = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      local name = {N['kn']}[idx + 1]
-      local v = {N['rawget']}({N['env']}, name)
-      if v == nil then
-        local ok2, env2 = pcall(getfenv)
-        if ok2 and type(env2) == "table" then v = env2[name] end
-      end
-      if v == nil then v = _G[name] end
-      push(v)
-    elseif op == OP_SETGLOBAL then
-      local idx = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      local name = {N['kn']}[idx + 1]
-      local val = pop()
-      if type({N['env']}) == "table" then
-        {N['rawset']}({N['env']}, name, val)
-      else
-        _G[name] = val
-      end
-    elseif op == OP_GETLOCAL then
-      local slot = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      push({N['locals']}[slot])
-    elseif op == OP_SETLOCAL then
-      local slot = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      {N['locals']}[slot] = pop()
-    elseif op == OP_ADD then local b,a = pop(),pop(); push(a+b)
-    elseif op == OP_SUB then local b,a = pop(),pop(); push(a-b)
-    elseif op == OP_MUL then local b,a = pop(),pop(); push(a*b)
-    elseif op == OP_DIV then local b,a = pop(),pop(); push(a/b)
-    elseif op == OP_MOD then local b,a = pop(),pop(); push(a%b)
-    elseif op == OP_POW then local b,a = pop(),pop(); push(a^b)
-    elseif op == OP_CONCAT then local b,a = pop(),pop(); push({N['tostring']}(a)..{N['tostring']}(b))
-    elseif op == OP_EQ then local b,a = pop(),pop(); push(a==b)
-    elseif op == OP_NE then local b,a = pop(),pop(); push(a~=b)
-    elseif op == OP_LT then local b,a = pop(),pop(); push(a<b)
-    elseif op == OP_LE then local b,a = pop(),pop(); push(a<=b)
-    elseif op == OP_GT then local b,a = pop(),pop(); push(a>b)
-    elseif op == OP_GE then local b,a = pop(),pop(); push(a>=b)
-    elseif op == OP_NOT then push(not pop())
-    elseif op == OP_UNM then push(-pop())
-    elseif op == OP_LEN then push(#pop())
-    elseif op == OP_JMP then
-      local off = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      if off >= 0x8000 then off = off - 0x10000 end
-      {N['pc']} = {N['pc']} + off
-    elseif op == OP_JMPIF then
-      local off = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      if off >= 0x8000 then off = off - 0x10000 end
-      if pop() then {N['pc']} = {N['pc']} + off end
-    elseif op == OP_JMPIFNOT then
-      local off = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      if off >= 0x8000 then off = off - 0x10000 end
-      if not pop() then {N['pc']} = {N['pc']} + off end
-    elseif op == OP_CALL then
-      local nargs = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      local nrets = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      local args2 = {{}}
-      for i = nargs, 1, -1 do args2[i] = pop() end
-      local fn = pop()
-      if {N['type']}(fn) == "function" then
-        local rets = {N['pack']}(fn({N['unpack']}(args2, 1, nargs)))
-        if nrets == 0 then
-          -- discard
-        elseif nrets == 1 then
-          push(rets[1])
-        else
-          for i = 1, nrets do push(rets[i]) end
-        end
-      else
-        push(nil)
-      end
-    elseif op == OP_RETURN then
-      local n = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      local rets = {{}}
-      for i = n, 1, -1 do rets[i] = pop() end
-      return {N['unpack']}(rets, 1, n)
-    elseif op == OP_POP then pop()
-    elseif op == OP_DUP then local v = pop(); push(v); push(v)
-    elseif op == OP_NEWTABLE then push({{}})
-    elseif op == OP_GETTABLE then
-      local key = pop(); local tbl = pop()
-      push(tbl[key])
-    elseif op == OP_SETTABLE then
-      local key = pop(); local val = pop(); local tbl = pop()
-      tbl[key] = val
-      push(tbl)
-    elseif op == OP_CLOSURE then
-      local entry = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      local nparams = {N['code']}[{N['pc']}]; {N['pc']} = {N['pc']} + 1
-      -- simplified: create function that re-enters VM at entry (limited)
-      local saved_code, saved_kn = {N['code']}, {N['kn']}
-      push(function(...)
-        -- run from entry with new locals/stack – limited nested support
-        return nil
-      end)
-    elseif op == OP_SELF then
-      local key = pop(); local obj = pop()
-      push(obj); push(obj[key])
-    elseif op == OP_HALT then
-      break
-    else
-      -- unknown / noise
-    end
-  end
-end
-return {N['vm']}(...)
-"""
-    body = re.sub(r"[ \t]+\n", "\n", body)
-    body = re.sub(r"\n{3,}", "\n\n", body)
-    return body.strip()
+        def ren_local(m):
+            names = m.group(1)
+            parts = [p.strip() for p in names.split(",")]
+            out = []
+            for p in parts:
+                if re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", p):
+                    if p not in reserved and len(p) > 1:
+                        if p not in mapping:
+                            mapping[p] = new_name()
+                        out.append(mapping[p])
+                    else:
+                        out.append(p)
+                else:
+                    out.append(p)
+            return "local " + ", ".join(out)
+
+        src = re.sub(
+            r"\blocal\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*,\s*[A-Za-z_][A-Za-z0-9_]*)*)",
+            ren_local,
+            src,
+        )
+        for old in sorted(mapping.keys(), key=len, reverse=True):
+            src = re.sub(rf"\b{re.escape(old)}\b", mapping[old], src)
+    except Exception:
+        pass
+    return src
 
 
-def _fallback_string_vm(src: str, intensity: str) -> str:
-    """If compile fails, still use encrypted bytecode of source as DATA only,
-    but reconstruct via VM ops char-by-char style is too heavy; use load as last resort
-    inside VM with heavy anti – marked as weak path."""
-    # Pack source as a single string constant + tiny program LOADK CALL load
-    # This path is weaker but keeps output working for complex scripts.
+def _emit_vm(src: str, intensity: str) -> str:
+    """Single encrypted setmetatable VM envelope – works on any Lua/Luau text."""
+    raw = src.encode("utf-8", errors="replace")
     key = bytes(random.randint(0, 255) for _ in range(16))
-    raw = src.encode("utf-8")
-    # fake "bytecode" that is just encrypted source with a header flag
-    blob = b"FALL" + raw
-    enc = _encode_bc(blob, key)
-    b85, alph, pad = _b85(enc)
-    N = {k: _rand_ident() for k in ("dec", "bxor", "floor", "char", "sub", "concat", "rg", "env", "load", "run")}
-    key_tbl = "{" + ",".join(str(b) for b in key) + "}"
+    scrambled, inv, alphabet, pad = _encode_payload(raw, key)
+
+    parts = []
+    for k, v in inv.items():
+        ks = k.replace("\\", "\\\\").replace('"', '\\"')
+        vs = v.replace("\\", "\\\\").replace('"', '\\"')
+        parts.append(f'["{ks}"] = "{vs}"')
+    random.shuffle(parts)
+    submap_lua = "{ " + " , ".join(parts) + " }"
+
+    slots = list(range(8, 220))
+    random.shuffle(slots)
+    (
+        s_char, s_gsub, s_concat, s_bxor, s_floor, s_type,
+        s_payload, s_submap, s_key, s_len, s_alpha, s_pad,
+        s_dec, s_run, s_boot, s_j1, s_j2, s_j3,
+    ) = slots[:18]
+
+    entry = random.choice(list("NBRXKZQMWYPHJFVTC"))
+    ot = _opaque_true()
+    junk_n = {"v1": 2, "v2": 4, "v3": 7}.get(intensity, 4)
+    junk = " ".join(_junk_block() for _ in range(junk_n))
+    anti = _anti_bundle(intensity)
+    key_tbl = "{ " + " , ".join(_num(b) for b in key) + " }"
+
     eq = "="
-    while f"]{eq}]" in b85:
+    while f"]{eq}]" in scrambled:
         eq += "="
-    payload = f"[{eq}[{b85}]{eq}]"
-    alph_esc = alph.replace("\\", "\\\\").replace('"', '\\"')
-    return f"""
-local {N['rg']}=rawget
-local {N['env']}=(type(_G)=="table" and _G) or {{}}
-local {N['floor']}=(math and math.floor) or math.floor
-local {N['char']}=(string and string.char) or string.char
-local {N['sub']}=(string and string.sub) or string.sub
-local {N['concat']}=(table and table.concat) or table.concat
-local {N['load']}=load or loadstring
-local function {N['bxor']}(a,b)
-a={N['floor']}(a)%256;b={N['floor']}(b)%256
-local r,p=0,1
-for _=1,8 do local ba,bb=a%2,b%2;r=r+((ba+bb)%2)*p;a={N['floor']}(a/2);b={N['floor']}(b/2);p=p*2 end
-return r end
-local function {N['dec']}(blob,alpha,key,pad)
-local base=#alpha;local idx={{}};for i=1,base do idx[{N['sub']}(alpha,i,i)]=i-1 end
-local digits={{}};for i=1,#blob do digits[#digits+1]=idx[{N['sub']}(blob,i,i)] end
-local bytes={{}};local di=1
-while di+4<=#digits do
-local n,p=0,1;for j=0,4 do n=n+(digits[di+j] or 0)*p;p=p*base end;di=di+5
-for j=0,3 do bytes[#bytes+1]=n%256;n={N['floor']}(n/256) end
+    payload_lit = f"[{eq}[{scrambled}]{eq}]"
+    alpha_esc = alphabet.replace("\\", "\\\\").replace('"', '\\"')
+
+    fake_n = {"v1": 3, "v2": 6, "v3": 10}.get(intensity, 6)
+    fakes = []
+    for i in range(fake_n):
+        sid = slots[18 + i] if 18 + i < len(slots) else random.randint(300, 900)
+        fakes.append(
+            f"[ {_num(sid)} ] = function(self, ...) "
+            f"local {_rand_ident()} = {_num(random.randint(1, 99999))} "
+            f"if {_opaque_false()} then return {_num(0)} end "
+            f"return {_num(random.randint(0, 255))} end"
+        )
+    fake_block = (" , " + " , ".join(fakes)) if fakes else ""
+
+    # Roblox-safe: use string/table/math globals directly inside VM methods
+    body = f"""return (function(...)
+{anti}
+local function _bx(x, y)
+x = math.floor(x) % 256
+y = math.floor(y) % 256
+local r, p = 0, 1
+for _ = 1, 8 do
+local bx, by = x % 2, y % 2
+r = r + ((bx + by) % 2) * p
+x = math.floor(x / 2)
+y = math.floor(y / 2)
+p = p * 2
 end
-if pad>0 then for i=1,pad do bytes[#bytes]=nil end end
-local state=key[1]+key[2]*256+key[3]*65536+key[4]*16777216;if state==0 then state=1 end
-local out={{}}
-for i=1,#bytes do
-state=(state*1664525+1013904223)%4294967296
-local k={N['floor']}(state/65536)%256
-out[i]={N['bxor']}({N['bxor']}(bytes[i],key[((i-1)%#key)+1]),{N['bxor']}(k,(i-1)*131%256))
+return r
 end
-return out
+return setmetatable({{
+[ {_num(s_char)} ] = string.char ,
+[ {_num(s_gsub)} ] = string.gsub ,
+[ {_num(s_concat)} ] = table.concat ,
+[ {_num(s_floor)} ] = math.floor ,
+[ {_num(s_type)} ] = type ,
+[ {_num(s_payload)} ] = {payload_lit} ,
+[ {_num(s_submap)} ] = {submap_lua} ,
+[ {_num(s_key)} ] = {key_tbl} ,
+[ {_num(s_len)} ] = {_num(len(raw))} ,
+[ {_num(s_alpha)} ] = "{alpha_esc}" ,
+[ {_num(s_pad)} ] = {_num(pad)} ,
+[ {_num(s_j1)} ] = {_num(random.randint(0x1000, 0xFFFFFF))} ,
+[ {_num(s_j2)} ] = {_num(random.randint(0x1000, 0xFFFFFF))} ,
+[ {_num(s_j3)} ] = function(self) return {_num(random.randint(1, 99))} end ,
+[ {_num(s_bxor)} ] = function(self, x, y) return _bx(x, y) end ,
+[ {_num(s_dec)} ] = function(self)
+local S = self[ {_num(s_payload)} ]
+local M = self[ {_num(s_submap)} ]
+local A = self[ {_num(s_alpha)} ]
+local K = self[ {_num(s_key)} ]
+local L = self[ {_num(s_len)} ]
+local base = #A
+local idx = {{}}
+for i = 1, base do idx[A:sub(i, i)] = i - 1 end
+local plain = string.gsub(S, ".", function(c) return M[c] or c end)
+if plain:sub(1, 3) ~= "EUN" then error("EUN") end
+plain = plain:sub(4)
+local digits = {{}}
+for i = 1, #plain do digits[#digits + 1] = idx[plain:sub(i, i)] end
+local bytes = {{}}
+local di = 1
+while di + 4 <= #digits do
+local n, p = 0, 1
+for j = 0, 4 do n = n + (digits[di + j] or 0) * p; p = p * base end
+di = di + 5
+for j = 0, 3 do bytes[#bytes + 1] = n % 256; n = math.floor(n / 256) end
 end
-local KEY={key_tbl}
-local bytes={N['dec']}({payload},"{alph_esc}",KEY,{_num(pad)})
-local chars={{}};for i=5,#bytes do chars[#chars+1]={N['char']}(bytes[i]) end
-local src={N['concat']}(chars)
-local fn,err={N['load']}(src)
+local out = {{}}
+for i = 1, L do
+local kb = K[((i - 1) % #K) + 1]
+local xb = _bx(bytes[i], kb)
+out[i] = string.char(_bx(xb, (i - 1) * 131))
+end
+return table.concat(out)
+end ,
+[ {_num(s_run)} ] = function(self, ...)
+{junk}
+local src = self[ {_num(s_dec)} ](self)
+local loader = load or loadstring
+local fn, err = loader(src)
 if not fn then error(err or "load") end
+if type(fn) ~= "function" then while true do end end
+if {ot} then return fn(...) end
 return fn(...)
-"""
+end ,
+[ {_num(s_boot)} ] = function(self, ...)
+return self[ {_num(s_run)} ](self, ...)
+end ,
+[ "{entry}" ] = function(self, ...)
+return self[ {_num(s_boot)} ](self, ...)
+end
+{fake_block}
+}} , {{ __index = function(t, k) return rawget(t, k) end }}) : {entry}(...)
+end)(...)"""
 
-
-def _inject_bc_junk(code, op, intensity: str):
-    """Insert dead NOP-like paths into bytecode (code anti-deobf)."""
-    if intensity == "v1":
-        return code
-    # use HALT never reached via JMP over junk, or POP-safe junk
-    # We insert: JMP +1, LOADNIL, POP  sequences between real ops
-    out = []
-    step = 4 if intensity == "v2" else 2
-    i = 0
-    # rough: after every few instructions insert junk that is jumped over
-    # simpler: prepend some dead locals noise constants already in pool
-    junk_op = op.get("POP", 1)
-    loadnil = op.get("LOADNIL", 2)
-    jmp = op.get("JMP", 3)
-    while i < len(code):
-        out.append(code[i])
-        i += 1
-        if i % step == 0 and i < len(code):
-            # JMP over 2 ops
-            out.append(jmp)
-            out.append(2)  # skip next 2
-            out.append(loadnil)
-            out.append(junk_op)
-    return out
+    body = re.sub(r"[ \t\r\n]+", " ", body).strip()
+    return body
 
 
 def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
@@ -1500,33 +740,27 @@ def obfuscate_code(code: str, intensity: str, options: List[str]) -> str:
     if intensity not in ("v1", "v2", "v3"):
         intensity = "v3"
 
+    # strip only pure comment lines for smaller payload; keep code intact
     cleaned = []
     for line in code.splitlines():
-        if line.strip().startswith("--"):
+        if line.strip().startswith("--") and not line.strip().startswith("--[["):
             continue
         cleaned.append(line)
     src = "\n".join(cleaned)
     if not src.strip():
         src = code
 
-    # Single-pass compile (fast)
-    bc, constants, op, ok = _compile_source(src)
+    # light rename only on smaller scripts
+    src = _rename_vars(src)
 
-    if ok and len(bc) > 2:
-        bc = _inject_bc_junk(bc, op, intensity)
-        # pad constants with meaningless values (var/code noise)
-        for _ in range({"v1": 2, "v2": 6, "v3": 14}.get(intensity, 6)):
-            constants.append(random.randint(0x1000, 0xFFFFFF))
-            constants.append("".join(random.choices("IlO0o1abcdef", k=random.randint(6, 14))))
-        key = bytes(random.randint(0, 255) for _ in range(16))
-        packed = _pack_program(bc, constants)
-        enc = _encode_bc(packed, key)
-        b85, alph, pad = _b85(enc)
-        current = _emit_vm_runtime(b85, alph, pad, key, op, intensity)
-    else:
-        current = _fallback_string_vm(src, intensity)
+    layer_map = {"v1": 2, "v2": 3, "v3": 4}
+    n_layers = layer_map.get(intensity, 3)
 
-    # no nested full-source re-wrap (keeps obfuscation fast)
+    current = src
+    for i in range(n_layers):
+        # outer layers always max anti
+        layer_i = intensity if intensity == "v3" else ("v2" if i == n_layers - 1 else "v1")
+        current = _emit_vm(current, layer_i)
 
     nl = chr(10)
     return (
